@@ -148,6 +148,43 @@ app.post("/create-ticket", async (req, res) => {
 // ===============================
 const PORT = process.env.PORT || 8000;
 
+app.post("/check-transaction", async (req, res) => {
+  try {
+    const { transactionId } = req.body;
+
+    const transaction = await Transaction.findOne({ transactionId });
+
+    if (!transaction) {
+      return res.json({
+        found: false,
+        message: "Transaction not found"
+      });
+    }
+
+    if (transaction.status === "failed") {
+      return res.json({
+        found: true,
+        status: "failed",
+        escalate: true,
+        message: "Transaction failed. Escalation required."
+      });
+    }
+
+    return res.json({
+      found: true,
+      status: transaction.status,
+      escalate: false,
+      message: `Transaction is ${transaction.status}`
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      error: "Error checking transaction"
+    });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
+
