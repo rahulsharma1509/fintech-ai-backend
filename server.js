@@ -21,10 +21,10 @@ app.use(express.json());
 console.log("Starting server...");
 
 // ===============================
-// 4️⃣ Global Rate Limit (Bot)
+// 4️⃣ Global Rate Limiter
 // ===============================
 let lastBotMessageTime = 0;
-const BOT_DELAY = 2000; // 2 seconds
+const BOT_DELAY = 2000;
 
 // ===============================
 // 5️⃣ MongoDB Connection
@@ -42,14 +42,14 @@ mongoose.connect(process.env.MONGO_URI)
 const transactionSchema = new mongoose.Schema({
   transactionId: String,
   amount: Number,
-  status: String, // success | failed | pending
+  status: String,
   userEmail: String
 });
 
 const Transaction = mongoose.model("Transaction", transactionSchema);
 
 // ===============================
-// 7️⃣ Seed Dummy Transactions
+// 7️⃣ Seed Dummy Data
 // ===============================
 async function seedTransactions() {
   const existing = await Transaction.find();
@@ -64,9 +64,52 @@ async function seedTransactions() {
 }
 
 // ===============================
-// 8️⃣ AI / Orchestration Logic
+// 8️⃣ Desk Ticket Creation
 // ===============================
-async function callDelightAI(userMessage, channelUrl) {
+async function createDeskTicket(channelUrl) {
+  await axios.post(
+    `https://desk-api-${process.env.SENDBIRD_APP_ID}.sendbird.com/v1/tickets`,
+    {
+      channel_url: channelUrl,
+      subject: "Transaction Escalation",
+      priority: "medium"
+    },
+    {
+      headers: {
+        "Api-Token": process.env.SENDBIRD_DESK_API_TOKEN,
+        "Content-Type": "application/json"
+      }
+    }
+  );
+}
+
+// ===============================
+// 9️⃣ HubSpot Ticket Creation
+// ===============================
+async function createHubSpotTicket(txnId, userEmail) {
+  await axios.post(
+    "https://api.hubapi.com/crm/v3/objects/tickets",
+    {
+      properties: {
+        subject: `Failed Transaction ${txnId}`,
+        content: `Transaction ${txnId} failed for ${userEmail}`,
+        hs_pipeline: "0",
+        hs_pipeline_stage: "1"
+      }
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.HUBSPOT_TOKEN}`,
+        "Content-Type": "application/json"
+      }
+    }
+  );
+}
+
+// ===============================
+// 🔟 AI / Orchestration Logic
+// ===============================
+async function handleMessage(userMessage, channelUrl) {
 
   const txnMatch = userMessage.match(/TXN\d+/i);
 
@@ -92,29 +135,12 @@ async function callDelightAI(userMessage, channelUrl) {
 
   if (transaction.status === "failed") {
 
-    // 1️⃣ Create HubSpot Ticket (CRM record)
-    await axios.post(
-      "https://api.hubapi.com/crm/v3/objects/tickets",
-      {
-        properties: {
-          subject: `Failed Transaction ${txnId}`,
-          content: `Transaction ${txnId} failed for ${transaction.userEmail}`,
-          hs_pipeline: "0",
-          hs_pipeline_stage: "1"
-        }
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.HUBSPOT_TOKEN}`,
-          "Content-Type": "application/json"
-        }
-      }
-    );
+    // Create CRM record
+    await createHubSpotTicket(txnId, transaction.userEmail);
 
     return {
       message: `Transaction ${txnId} failed. Escalating to human support.`,
-      escalate: true,
-      txnId
+      escalate: true
     };
   }
 
@@ -125,16 +151,17 @@ async function callDelightAI(userMessage, channelUrl) {
 }
 
 // ===============================
-// 9️⃣ Send Message As Bot
+// 1️⃣1️⃣ Send Message As Bot
 // ===============================
 async function sendMessageAsBot(channelUrl, message) {
 
   const now = Date.now();
-  const timeSinceLastMessage = now - lastBotMessageTime;
+  const diff = now - lastBotMessageTime;
 
-  if (timeSinceLastMessage < BOT_DELAY) {
-    const waitTime = BOT_DELAY - timeSinceLastMessage;
-    await new Promise(resolve => setTimeout(resolve, waitTime));
+  if (diff < BOT_DELAY) {
+    await new Promise(resolve =>
+      setTimeout(resolve, BOT_DELAY - diff)
+    );
   }
 
   await axios.post(
@@ -156,33 +183,8 @@ async function sendMessageAsBot(channelUrl, message) {
 }
 
 // ===============================
-// 🔟 ROUTES
+// 1️⃣2️⃣ Webhook Route
 // ===============================
-
-// Health Check
-app.get("/", (req, res) => {
-  res.send("Fintech Backend Running 🚀");
-});
-
-// Transaction Lookup API
-app.get("/transaction/:id", async (req, res) => {
-  try {
-    const transaction = await Transaction.findOne({
-      transactionId: req.params.id
-    });
-
-    if (!transaction) {
-      return res.status(404).json({ message: "Transaction not found" });
-    }
-
-    res.json(transaction);
-
-  } catch (error) {
-    res.status(500).json({ error: "Error fetching transaction" });
-  }
-});
-
-// Sendbird Webhook
 app.post("/sendbird-webhook", async (req, res) => {
   try {
     const event = req.body;
@@ -197,22 +199,34 @@ app.post("/sendbird-webhook", async (req, res) => {
         return res.sendStatus(200);
       }
 
+      // Ignore bot messages
       if (senderId === "support_bot") {
         return res.sendStatus(200);
       }
 
-      const aiResponse = await callDelightAI(userMessage, channelUrl);
+      const response = await handleMessage(userMessage, channelUrl);
 
-      // Send bot reply
-      await sendMessageAsBot(channelUrl, aiResponse.message);
+      await sendMessageAsBot(channelUrl, response.message);
+
+      // Create Desk ticket if escalation needed
+      if (response.escalate) {
+        await createDeskTicket(channelUrl);
+      }
     }
 
     res.sendStatus(200);
 
   } catch (error) {
-    console.error("Webhook error:", error);
+    console.error("Webhook error:", error.response?.data || error.message);
     res.sendStatus(500);
   }
+});
+
+// ===============================
+// 1️⃣3️⃣ Health Check
+// ===============================
+app.get("/", (req, res) => {
+  res.send("Fintech Backend Running 🚀");
 });
 
 // ===============================
