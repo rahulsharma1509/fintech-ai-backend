@@ -61,27 +61,49 @@ async function seedTransactions() {
 // 7️⃣ HELPER FUNCTIONS
 // ===============================
 async function callDelightAI(userMessage) {
-  if (userMessage.includes("TXN1001")) {
-    return "I see your transaction TXN1001 failed. Let me escalate this.";
-  }
-  return "Thank you for your message. Our team will assist you.";
-}
 
-async function sendMessageAsBot(channelUrl, message) {
-  await axios.post(
-    `https://api-${process.env.SENDBIRD_APP_ID}.sendbird.com/v3/group_channels/${channelUrl}/messages`,
-    {
-      message_type: "MESG",
-      user_id: "support_bot",
-      message: message
-    },
-    {
-      headers: {
-        "Api-Token": process.env.SENDBIRD_API_TOKEN,
-        "Content-Type": "application/json"
+  // Extract transaction ID dynamically
+  const txnMatch = userMessage.match(/TXN\d+/i);
+
+  if (!txnMatch) {
+    return "Please provide your transaction ID (e.g., TXN1001).";
+  }
+
+  const txnId = txnMatch[0].toUpperCase();
+
+  const transaction = await Transaction.findOne({
+    transactionId: txnId
+  });
+
+  if (!transaction) {
+    return `Transaction ${txnId} not found.`;
+  }
+
+  if (transaction.status === "failed") {
+
+    // Create HubSpot ticket automatically
+    await axios.post(
+      "https://api.hubapi.com/crm/v3/objects/tickets",
+      {
+        properties: {
+          subject: `Failed Transaction ${txnId}`,
+          content: `Transaction ${txnId} failed for ${transaction.userEmail}`,
+          hs_pipeline: "0",
+          hs_pipeline_stage: "1"
+        }
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.HUBSPOT_TOKEN}`,
+          "Content-Type": "application/json"
+        }
       }
-    }
-  );
+    );
+
+    return `Transaction ${txnId} failed. I have escalated this to our support team.`;
+  }
+
+  return `Transaction ${txnId} status: ${transaction.status}`;
 }
 
 // ===============================
