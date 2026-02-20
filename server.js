@@ -6,8 +6,8 @@ require("dotenv").config();
 // ===============================
 // 2️⃣ Import Dependencies
 // ===============================
-const mongoose = require("mongoose");
 const express = require("express");
+const mongoose = require("mongoose");
 const axios = require("axios");
 const cors = require("cors");
 
@@ -21,7 +21,13 @@ app.use(express.json());
 console.log("Starting server...");
 
 // ===============================
-// 4️⃣ Connect to MongoDB
+// 4️⃣ Global Rate Limit (Bot)
+// ===============================
+let lastBotMessageTime = 0;
+const BOT_DELAY = 2000; // 2 seconds
+
+// ===============================
+// 5️⃣ MongoDB Connection
 // ===============================
 mongoose.connect(process.env.MONGO_URI)
   .then(() => {
@@ -31,19 +37,19 @@ mongoose.connect(process.env.MONGO_URI)
   .catch(err => console.error("MongoDB Error:", err));
 
 // ===============================
-// 5️⃣ Transaction Schema
+// 6️⃣ Transaction Schema
 // ===============================
 const transactionSchema = new mongoose.Schema({
   transactionId: String,
   amount: Number,
-  status: String,
+  status: String, // success | failed | pending
   userEmail: String
 });
 
 const Transaction = mongoose.model("Transaction", transactionSchema);
 
 // ===============================
-// 6️⃣ Seed Dummy Data
+// 7️⃣ Seed Dummy Transactions
 // ===============================
 async function seedTransactions() {
   const existing = await Transaction.find();
@@ -58,11 +64,10 @@ async function seedTransactions() {
 }
 
 // ===============================
-// 7️⃣ HELPER FUNCTIONS
+// 8️⃣ AI / Orchestration Logic
 // ===============================
 async function callDelightAI(userMessage) {
 
-  // Extract transaction ID dynamically
   const txnMatch = userMessage.match(/TXN\d+/i);
 
   if (!txnMatch) {
@@ -81,7 +86,7 @@ async function callDelightAI(userMessage) {
 
   if (transaction.status === "failed") {
 
-    // Create HubSpot ticket automatically
+    // Auto create HubSpot ticket
     await axios.post(
       "https://api.hubapi.com/crm/v3/objects/tickets",
       {
@@ -107,68 +112,8 @@ async function callDelightAI(userMessage) {
 }
 
 // ===============================
-// 8️⃣ ROUTES
+// 9️⃣ Send Message As Bot
 // ===============================
-
-// Health check
-app.get("/", (req, res) => {
-  res.send("Fintech Backend Running 🚀");
-});
-
-// Transaction lookup
-app.get("/transaction/:id", async (req, res) => {
-  try {
-    const transaction = await Transaction.findOne({
-      transactionId: req.params.id
-    });
-
-    if (!transaction) {
-      return res.status(404).json({ message: "Transaction not found" });
-    }
-
-    res.json(transaction);
-
-  } catch (error) {
-    res.status(500).json({ error: "Error fetching transaction" });
-  }
-});
-
-// HubSpot ticket creation
-app.post("/create-ticket", async (req, res) => {
-  try {
-    const { email, issue } = req.body;
-
-    const response = await axios.post(
-      "https://api.hubapi.com/crm/v3/objects/tickets",
-      {
-        properties: {
-          subject: issue,
-          content: issue,
-          hs_pipeline: "0",
-          hs_pipeline_stage: "1"
-        }
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.HUBSPOT_TOKEN}`,
-          "Content-Type": "application/json"
-        }
-      }
-    );
-
-    res.status(200).json({
-      message: "Ticket created successfully",
-      ticketId: response.data.id
-    });
-
-  } catch (error) {
-    console.error("HubSpot Error:", error.response?.data || error.message);
-    res.status(500).json({ error: "Ticket creation failed" });
-  }
-});
-
-
-//sendMessageAsBot
 async function sendMessageAsBot(channelUrl, message) {
 
   const now = Date.now();
@@ -197,7 +142,34 @@ async function sendMessageAsBot(channelUrl, message) {
   lastBotMessageTime = Date.now();
 }
 
-// Sendbird webhook
+// ===============================
+// 🔟 ROUTES
+// ===============================
+
+// Health Check
+app.get("/", (req, res) => {
+  res.send("Fintech Backend Running 🚀");
+});
+
+// Transaction Lookup API
+app.get("/transaction/:id", async (req, res) => {
+  try {
+    const transaction = await Transaction.findOne({
+      transactionId: req.params.id
+    });
+
+    if (!transaction) {
+      return res.status(404).json({ message: "Transaction not found" });
+    }
+
+    res.json(transaction);
+
+  } catch (error) {
+    res.status(500).json({ error: "Error fetching transaction" });
+  }
+});
+
+// Sendbird Webhook
 app.post("/sendbird-webhook", async (req, res) => {
   try {
     const event = req.body;
@@ -211,10 +183,10 @@ app.post("/sendbird-webhook", async (req, res) => {
       const senderId = event.sender?.user_id;
 
       if (!userMessage || !channelUrl) {
-        console.log("Missing message or channelUrl");
         return res.sendStatus(200);
       }
 
+      // Ignore bot's own messages
       if (senderId === "support_bot") {
         return res.sendStatus(200);
       }
@@ -232,7 +204,7 @@ app.post("/sendbird-webhook", async (req, res) => {
 });
 
 // ===============================
-// 🔟 START SERVER (ONLY ONCE)
+// 🚀 START SERVER
 // ===============================
 const PORT = process.env.PORT || 8000;
 
