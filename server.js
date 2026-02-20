@@ -77,20 +77,20 @@ async function createHubSpotTicket(txnId, userEmail) {
 --------------------------- */
 async function createDeskTicket(channelUrl, senderId) {
   await axios.post(
-    "https://api.sendbirddesk.com/v1/platform/tickets",
+    `https://desk-api-${process.env.SENDBIRD_APP_ID}.sendbird.com/platform/v1/tickets`,
     {
       channel_url: channelUrl,
       subject: "Transaction Escalation",
       customer: {
         id: senderId,
-        name: senderId,
-      },
+        name: senderId
+      }
     },
     {
       headers: {
         "Api-Token": process.env.SENDBIRD_DESK_API_TOKEN,
-        "Content-Type": "application/json",
-      },
+        "Content-Type": "application/json"
+      }
     }
   );
 }
@@ -180,16 +180,23 @@ app.post("/sendbird-webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
+    const messageId = event.payload?.message_id;
     const userMessage = event.payload?.message;
     const channelUrl = event.channel?.channel_url;
     const senderId = event.sender?.user_id;
 
-    if (!userMessage || !channelUrl || !senderId) {
+    if (!messageId || !userMessage || !channelUrl || !senderId) {
       return res.sendStatus(200);
     }
 
+    // 🔥 Prevent duplicate processing
+    if (processedMessages.has(messageId)) {
+      return res.sendStatus(200);
+    }
+
+    processedMessages.add(messageId);
+
     if (senderId === "support_bot") {
-      console.log("Ignored bot message");
       return res.sendStatus(200);
     }
 
@@ -198,11 +205,11 @@ app.post("/sendbird-webhook", async (req, res) => {
     await sendMessageAsBot(channelUrl, response.message);
 
     if (response.escalate) {
-      console.log("Creating Desk ticket...");
       await createDeskTicket(channelUrl, senderId);
     }
 
     return res.sendStatus(200);
+
   } catch (error) {
     console.error("Webhook error:", error.response?.data || error.message);
     return res.sendStatus(500);
