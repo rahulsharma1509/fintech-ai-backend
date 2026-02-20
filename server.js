@@ -189,29 +189,30 @@ app.post("/sendbird-webhook", async (req, res) => {
   try {
     const event = req.body;
 
-    if (event.category === "group_channel:message_send") {
+    if (event.category !== "group_channel:message_send") {
+      return res.sendStatus(200);
+    }
 
-      const userMessage = event.payload?.message;
-      const channelUrl = event.channel?.channel_url;
-      const senderId = event.sender?.user_id;
+    const userMessage = event.payload?.message;
+    const channelUrl = event.channel?.channel_url;
+    const senderId = event.sender?.user_id;  // ✅ correct path
 
-      if (!userMessage || !channelUrl) {
-        return res.sendStatus(200);
-      }
+    if (!userMessage || !channelUrl || !senderId) {
+      return res.sendStatus(200);
+    }
 
-      // Ignore bot messages
-      if (senderId === "support_bot") {
-        return res.sendStatus(200);
-      }
+    // ✅ VERY IMPORTANT: ignore bot messages
+    if (senderId === "support_bot") {
+      console.log("Ignoring bot message");
+      return res.sendStatus(200);
+    }
 
-      const response = await handleMessage(userMessage, channelUrl);
+    const response = await handleMessage(userMessage, channelUrl);
 
-      await sendMessageAsBot(channelUrl, response.message);
+    await sendMessageAsBot(channelUrl, response.message);
 
-      // Create Desk ticket if escalation needed
-      if (response.escalate) {
-        await createDeskTicket(channelUrl);
-      }
+    if (response.escalate) {
+      await createDeskTicket(channelUrl);
     }
 
     res.sendStatus(200);
