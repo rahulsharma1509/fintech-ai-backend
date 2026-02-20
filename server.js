@@ -11,15 +11,16 @@ app.use(express.json());
 
 console.log("Starting server...");
 
-/* --------------------------
-   GLOBAL BOT RATE LIMIT
---------------------------- */
+/* =====================================
+   GLOBAL STATE
+===================================== */
 let lastBotMessageTime = 0;
 const BOT_DELAY = 2000;
+const processedMessages = new Set();
 
-/* --------------------------
-   DATABASE
---------------------------- */
+/* =====================================
+   MONGODB CONNECTION
+===================================== */
 mongoose
   .connect(process.env.MONGO_URI)
   .then(() => {
@@ -28,6 +29,9 @@ mongoose
   })
   .catch((err) => console.error("MongoDB Error:", err));
 
+/* =====================================
+   TRANSACTION MODEL
+===================================== */
 const transactionSchema = new mongoose.Schema({
   transactionId: String,
   amount: Number,
@@ -37,6 +41,9 @@ const transactionSchema = new mongoose.Schema({
 
 const Transaction = mongoose.model("Transaction", transactionSchema);
 
+/* =====================================
+   SEED DATA
+===================================== */
 async function seedTransactions() {
   const existing = await Transaction.find();
   if (existing.length === 0) {
@@ -49,55 +56,67 @@ async function seedTransactions() {
   }
 }
 
-/* --------------------------
+/* =====================================
    HUBSPOT TICKET
---------------------------- */
+===================================== */
 async function createHubSpotTicket(txnId, userEmail) {
-  await axios.post(
-    "https://api.hubapi.com/crm/v3/objects/tickets",
-    {
-      properties: {
-        subject: `Failed Transaction ${txnId}`,
-        content: `Transaction ${txnId} failed for ${userEmail}`,
-        hs_pipeline: "0",
-        hs_pipeline_stage: "1",
+  try {
+    await axios.post(
+      "https://api.hubapi.com/crm/v3/objects/tickets",
+      {
+        properties: {
+          subject: `Failed Transaction ${txnId}`,
+          content: `Transaction ${txnId} failed for ${userEmail}`,
+          hs_pipeline: "0",
+          hs_pipeline_stage: "1",
+        },
       },
-    },
-    {
-      headers: {
-        Authorization: `Bearer ${process.env.HUBSPOT_TOKEN}`,
-        "Content-Type": "application/json",
-      },
-    }
-  );
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.HUBSPOT_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    console.log("HubSpot ticket created");
+  } catch (err) {
+    console.error("HubSpot error:", err.response?.data || err.message);
+  }
 }
 
-/* --------------------------
+/* =====================================
    DESK TICKET
---------------------------- */
+===================================== */
 async function createDeskTicket(channelUrl, senderId) {
-  await axios.post(
-    `https://desk-api-${process.env.SENDBIRD_APP_ID}.sendbird.com/platform/v1/tickets`,
-    {
-      channel_url: channelUrl,
-      subject: "Transaction Escalation",
-      customer: {
-        id: senderId,
-        name: senderId
+  try {
+    await axios.post(
+      `https://desk-api-${process.env.SENDBIRD_APP_ID}.sendbird.com/platform/v1/tickets`,
+      {
+        channel_url: channelUrl,
+        subject: "Transaction Escalation",
+        customer: {
+          id: senderId,
+          name: senderId,
+        },
+      },
+      {
+        headers: {
+          "Api-Token": process.env.SENDBIRD_DESK_API_TOKEN,
+          "Content-Type": "application/json",
+        },
       }
-    },
-    {
-      headers: {
-        "Api-Token": process.env.SENDBIRD_DESK_API_TOKEN,
-        "Content-Type": "application/json"
-      }
-    }
-  );
+    );
+
+    console.log("Desk ticket created");
+  } catch (err) {
+    console.error("Desk creation error:", err.response?.data || err.message);
+  }
 }
 
-/* --------------------------
-   AI / BUSINESS LOGIC
---------------------------- */
+/* =====================================
+   AI LOGIC
+===================================== */
 async function handleMessage(userMessage) {
   const txnMatch = userMessage.match(/TXN\d+/i);
 
@@ -127,8 +146,6 @@ async function handleMessage(userMessage) {
     return {
       message: `Transaction ${txnId} failed. Escalating to human support.`,
       escalate: true,
-      txnId,
-      userEmail: transaction.userEmail,
     };
   }
 
@@ -138,9 +155,9 @@ async function handleMessage(userMessage) {
   };
 }
 
-/* --------------------------
-   SEND BOT MESSAGE
---------------------------- */
+/* =====================================
+   SEND MESSAGE AS BOT
+===================================== */
 async function sendMessageAsBot(channelUrl, message) {
   const now = Date.now();
   const diff = now - lastBotMessageTime;
@@ -156,7 +173,7 @@ async function sendMessageAsBot(channelUrl, message) {
     {
       message_type: "MESG",
       user_id: "support_bot",
-      message: message,
+      message,
     },
     {
       headers: {
@@ -169,9 +186,9 @@ async function sendMessageAsBot(channelUrl, message) {
   lastBotMessageTime = Date.now();
 }
 
-/* --------------------------
+/* =====================================
    WEBHOOK
---------------------------- */
+===================================== */
 app.post("/sendbird-webhook", async (req, res) => {
   try {
     const event = req.body;
@@ -189,7 +206,6 @@ app.post("/sendbird-webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // 🔥 Prevent duplicate processing
     if (processedMessages.has(messageId)) {
       return res.sendStatus(200);
     }
@@ -209,23 +225,22 @@ app.post("/sendbird-webhook", async (req, res) => {
     }
 
     return res.sendStatus(200);
-
   } catch (error) {
     console.error("Webhook error:", error.response?.data || error.message);
     return res.sendStatus(500);
   }
 });
 
-/* --------------------------
-   HEALTH CHECK
---------------------------- */
+/* =====================================
+   HEALTH
+===================================== */
 app.get("/", (req, res) => {
   res.send("Fintech Backend Running 🚀");
 });
 
-/* --------------------------
+/* =====================================
    START SERVER
---------------------------- */
+===================================== */
 const PORT = process.env.PORT || 8000;
 
 app.listen(PORT, () => {
