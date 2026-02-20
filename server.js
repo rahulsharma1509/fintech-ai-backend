@@ -67,20 +67,29 @@ async function seedTransactions() {
 // 8️⃣ Desk Ticket Creation
 // ===============================
 async function createDeskTicket(channelUrl) {
-  await axios.post(
-    `https://desk-api-${process.env.SENDBIRD_APP_ID}.sendbird.com/v1/tickets`,
-    {
-      channel_url: channelUrl,
-      subject: "Transaction Escalation",
-      priority: "medium"
-    },
-    {
-      headers: {
-        "Api-Token": process.env.SENDBIRD_DESK_API_TOKEN,
-        "Content-Type": "application/json"
+  try {
+    await axios.post(
+      `https://desk-api.sendbird.com/v1/platform/${process.env.SENDBIRD_APP_ID}/tickets`,
+      {
+        channel_url: channelUrl,
+        subject: "Transaction Escalation",
+        priority: "medium"
+      },
+      {
+        headers: {
+          "Api-Token": process.env.SENDBIRD_DESK_API_TOKEN,
+          "Content-Type": "application/json"
+        }
       }
-    }
-  );
+    );
+
+    console.log("Desk ticket created successfully");
+
+  } catch (error) {
+    console.error("Desk creation error:",
+      error.response?.data || error.message
+    );
+  }
 }
 
 // ===============================
@@ -195,15 +204,15 @@ app.post("/sendbird-webhook", async (req, res) => {
 
     const userMessage = event.payload?.message;
     const channelUrl = event.channel?.channel_url;
-    const senderId = event.sender?.user_id;  // ✅ correct path
+    const senderId = event.sender?.user_id;
 
     if (!userMessage || !channelUrl || !senderId) {
       return res.sendStatus(200);
     }
 
-    // ✅ VERY IMPORTANT: ignore bot messages
+    // 🔥 VERY IMPORTANT — prevent infinite loop
     if (senderId === "support_bot") {
-      console.log("Ignoring bot message");
+      console.log("Ignored bot message");
       return res.sendStatus(200);
     }
 
@@ -212,14 +221,15 @@ app.post("/sendbird-webhook", async (req, res) => {
     await sendMessageAsBot(channelUrl, response.message);
 
     if (response.escalate) {
+      console.log("Creating Desk ticket...");
       await createDeskTicket(channelUrl);
     }
 
-    res.sendStatus(200);
+    return res.sendStatus(200);
 
   } catch (error) {
     console.error("Webhook error:", error.response?.data || error.message);
-    res.sendStatus(500);
+    return res.sendStatus(500);
   }
 });
 
