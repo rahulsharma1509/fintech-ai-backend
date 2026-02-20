@@ -151,13 +151,16 @@ app.post("/sendbird-webhook", async (req, res) => {
     const event = req.body;
 
     console.log("Webhook Event:", event.category);
+    console.log("Full event:", JSON.stringify(event, null, 2));
 
     if (event.category === "group_channel:message_send") {
 
-      const userMessage = event.payload.message;
-      const channelUrl = event.payload.channel.channel_url;
+      const userMessage = event.message;
+      const channelUrl = event.channel.channel_url;
+      const senderId = event.sender.user_id;
 
-      if (event.payload.sender.user_id === "support_bot") {
+      // Ignore bot's own messages
+      if (senderId === "support_bot") {
         return res.sendStatus(200);
       }
 
