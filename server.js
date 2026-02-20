@@ -151,15 +151,18 @@ app.post("/sendbird-webhook", async (req, res) => {
     const event = req.body;
 
     console.log("Webhook Event:", event.category);
-    console.log("Full event:", JSON.stringify(event, null, 2));
 
     if (event.category === "group_channel:message_send") {
 
-      const userMessage = event.message;
-      const channelUrl = event.channel.channel_url;
-      const senderId = event.sender.user_id;
+      const userMessage = event.payload?.message;
+      const channelUrl = event.channel?.channel_url;
+      const senderId = event.sender?.user_id;
 
-      // Ignore bot's own messages
+      if (!userMessage || !channelUrl) {
+        console.log("Missing message or channelUrl");
+        return res.sendStatus(200);
+      }
+
       if (senderId === "support_bot") {
         return res.sendStatus(200);
       }
