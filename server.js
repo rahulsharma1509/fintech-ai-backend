@@ -167,6 +167,36 @@ app.post("/create-ticket", async (req, res) => {
   }
 });
 
+
+//sendMessageAsBot
+async function sendMessageAsBot(channelUrl, message) {
+
+  const now = Date.now();
+  const timeSinceLastMessage = now - lastBotMessageTime;
+
+  if (timeSinceLastMessage < BOT_DELAY) {
+    const waitTime = BOT_DELAY - timeSinceLastMessage;
+    await new Promise(resolve => setTimeout(resolve, waitTime));
+  }
+
+  await axios.post(
+    `https://api-${process.env.SENDBIRD_APP_ID}.sendbird.com/v3/group_channels/${channelUrl}/messages`,
+    {
+      message_type: "MESG",
+      user_id: "support_bot",
+      message: message
+    },
+    {
+      headers: {
+        "Api-Token": process.env.SENDBIRD_API_TOKEN,
+        "Content-Type": "application/json"
+      }
+    }
+  );
+
+  lastBotMessageTime = Date.now();
+}
+
 // Sendbird webhook
 app.post("/sendbird-webhook", async (req, res) => {
   try {
