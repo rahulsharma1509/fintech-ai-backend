@@ -66,12 +66,15 @@ async function seedTransactions() {
 // ===============================
 // 8️⃣ AI / Orchestration Logic
 // ===============================
-async function callDelightAI(userMessage) {
+async function callDelightAI(userMessage, channelUrl) {
 
   const txnMatch = userMessage.match(/TXN\d+/i);
 
   if (!txnMatch) {
-    return "Please provide your transaction ID (e.g., TXN1001).";
+    return {
+      message: "Please provide your transaction ID (e.g., TXN1001).",
+      escalate: false
+    };
   }
 
   const txnId = txnMatch[0].toUpperCase();
@@ -81,12 +84,15 @@ async function callDelightAI(userMessage) {
   });
 
   if (!transaction) {
-    return `Transaction ${txnId} not found.`;
+    return {
+      message: `Transaction ${txnId} not found.`,
+      escalate: false
+    };
   }
 
   if (transaction.status === "failed") {
 
-    // Auto create HubSpot ticket
+    // 1️⃣ Create HubSpot Ticket (CRM record)
     await axios.post(
       "https://api.hubapi.com/crm/v3/objects/tickets",
       {
@@ -105,10 +111,17 @@ async function callDelightAI(userMessage) {
       }
     );
 
-    return `Transaction ${txnId} failed. I have escalated this to our support team.`;
+    return {
+      message: `Transaction ${txnId} failed. Escalating to human support.`,
+      escalate: true,
+      txnId
+    };
   }
 
-  return `Transaction ${txnId} status: ${transaction.status}`;
+  return {
+    message: `Transaction ${txnId} status: ${transaction.status}`,
+    escalate: false
+  };
 }
 
 // ===============================
@@ -174,8 +187,6 @@ app.post("/sendbird-webhook", async (req, res) => {
   try {
     const event = req.body;
 
-    console.log("Webhook Event:", event.category);
-
     if (event.category === "group_channel:message_send") {
 
       const userMessage = event.payload?.message;
@@ -186,13 +197,14 @@ app.post("/sendbird-webhook", async (req, res) => {
         return res.sendStatus(200);
       }
 
-      // Ignore bot's own messages
       if (senderId === "support_bot") {
         return res.sendStatus(200);
       }
 
-      const aiReply = await callDelightAI(userMessage);
-      await sendMessageAsBot(channelUrl, aiReply);
+      const aiResponse = await callDelightAI(userMessage, channelUrl);
+
+      // Send bot reply
+      await sendMessageAsBot(channelUrl, aiResponse.message);
     }
 
     res.sendStatus(200);
