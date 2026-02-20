@@ -90,12 +90,13 @@ async function createHubSpotTicket(txnId, userEmail) {
 ===================================== */
 async function createDeskTicket(channelUrl, senderId) {
   try {
-    const authString = `${process.env.SENDBIRD_APP_ID}:${process.env.SENDBIRD_DESK_API_TOKEN}`;
-    const encodedAuth = Buffer.from(authString).toString("base64");
-console.log("APP_ID:", process.env.SENDBIRD_APP_ID);
-console.log("DESK TOKEN LENGTH:", process.env.SENDBIRD_DESK_API_TOKEN?.length);
+    const token = process.env.SENDBIRD_DESK_API_TOKEN;
 
-    await axios.post(
+    const encodedAuth = Buffer.from(`${token}:`).toString("base64");
+
+    console.log("Creating Desk ticket...");
+
+    const response = await axios.post(
       `https://desk-api-${process.env.SENDBIRD_APP_ID}.sendbird.com/platform/v1/tickets`,
       {
         channel_url: channelUrl,
@@ -113,9 +114,14 @@ console.log("DESK TOKEN LENGTH:", process.env.SENDBIRD_DESK_API_TOKEN?.length);
       }
     );
 
-    console.log("Desk ticket created successfully");
+    console.log("Desk ticket created:", response.data.id);
+
   } catch (err) {
-    console.error("Desk creation error:", err.response?.data || err.message);
+    console.error(
+      "Desk creation error:",
+      err.response?.status,
+      err.response?.data || err.message
+    );
   }
 }
 
