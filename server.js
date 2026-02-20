@@ -68,7 +68,7 @@ async function seedTransactions() {
 // ===============================
 async function createDeskTicket(channelUrl) {
   try {
-    await axios.post(
+    const response = await axios.post(
       `https://desk-api-${process.env.SENDBIRD_APP_ID}.sendbird.com/platform/v1/tickets`,
       {
         channel_url: channelUrl,
@@ -77,13 +77,13 @@ async function createDeskTicket(channelUrl) {
       },
       {
         headers: {
-          "Api-Token": process.env.SENDBIRD_DESK_API_TOKEN,
+          Authorization: `Token ${process.env.SENDBIRD_DESK_API_TOKEN}`,
           "Content-Type": "application/json"
         }
       }
     );
 
-    console.log("Desk ticket created successfully");
+    console.log("Desk ticket created successfully:", response.data);
 
   } catch (error) {
     console.error(
