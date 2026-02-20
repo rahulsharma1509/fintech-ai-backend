@@ -26,7 +26,7 @@ console.log("Starting server...");
 mongoose.connect(process.env.MONGO_URI)
   .then(() => {
     console.log("MongoDB Connected");
-    seedTransactions(); // Seed after DB connects
+    seedTransactions();
   })
   .catch(err => console.error("MongoDB Error:", err));
 
@@ -36,54 +36,64 @@ mongoose.connect(process.env.MONGO_URI)
 const transactionSchema = new mongoose.Schema({
   transactionId: String,
   amount: Number,
-  status: String, // success | failed | pending
+  status: String,
   userEmail: String
 });
 
 const Transaction = mongoose.model("Transaction", transactionSchema);
 
 // ===============================
-// 6️⃣ Seed Dummy Data (One-time)
+// 6️⃣ Seed Dummy Data
 // ===============================
 async function seedTransactions() {
   const existing = await Transaction.find();
-
   if (existing.length === 0) {
     await Transaction.insertMany([
-      {
-        transactionId: "TXN1001",
-        amount: 500,
-        status: "failed",
-        userEmail: "rahul@test.com"
-      },
-      {
-        transactionId: "TXN1002",
-        amount: 1200,
-        status: "success",
-        userEmail: "rahul@test.com"
-      },
-      {
-        transactionId: "TXN1003",
-        amount: 300,
-        status: "pending",
-        userEmail: "rahul@test.com"
-      }
+      { transactionId: "TXN1001", amount: 500, status: "failed", userEmail: "rahul@test.com" },
+      { transactionId: "TXN1002", amount: 1200, status: "success", userEmail: "rahul@test.com" },
+      { transactionId: "TXN1003", amount: 300, status: "pending", userEmail: "rahul@test.com" }
     ]);
-
     console.log("Dummy transactions inserted");
   }
 }
 
 // ===============================
-// 7️⃣ Health Check Route
+// 7️⃣ HELPER FUNCTIONS
 // ===============================
+async function callDelightAI(userMessage) {
+  if (userMessage.includes("TXN1001")) {
+    return "I see your transaction TXN1001 failed. Let me escalate this.";
+  }
+  return "Thank you for your message. Our team will assist you.";
+}
+
+async function sendMessageAsBot(channelUrl, message) {
+  await axios.post(
+    `https://api-${process.env.SENDBIRD_APP_ID}.sendbird.com/v3/group_channels/${channelUrl}/messages`,
+    {
+      message_type: "MESG",
+      user_id: "support_bot",
+      message: message
+    },
+    {
+      headers: {
+        "Api-Token": process.env.SENDBIRD_API_TOKEN,
+        "Content-Type": "application/json"
+      }
+    }
+  );
+}
+
+// ===============================
+// 8️⃣ ROUTES
+// ===============================
+
+// Health check
 app.get("/", (req, res) => {
   res.send("Fintech Backend Running 🚀");
 });
 
-// ===============================
-// 8️⃣ Transaction Lookup API
-// ===============================
+// Transaction lookup
 app.get("/transaction/:id", async (req, res) => {
   try {
     const transaction = await Transaction.findOne({
@@ -91,23 +101,17 @@ app.get("/transaction/:id", async (req, res) => {
     });
 
     if (!transaction) {
-      return res.status(404).json({
-        message: "Transaction not found"
-      });
+      return res.status(404).json({ message: "Transaction not found" });
     }
 
     res.json(transaction);
 
   } catch (error) {
-    res.status(500).json({
-      error: "Error fetching transaction"
-    });
+    res.status(500).json({ error: "Error fetching transaction" });
   }
 });
 
-// ===============================
-// 9️⃣ HubSpot Ticket Creation
-// ===============================
+// HubSpot ticket creation
 app.post("/create-ticket", async (req, res) => {
   try {
     const { email, issue } = req.body;
@@ -137,54 +141,43 @@ app.post("/create-ticket", async (req, res) => {
 
   } catch (error) {
     console.error("HubSpot Error:", error.response?.data || error.message);
-    res.status(500).json({
-      error: "Ticket creation failed"
-    });
+    res.status(500).json({ error: "Ticket creation failed" });
   }
 });
 
-// ===============================
-// 🔟 Start Server
-// ===============================
-const PORT = process.env.PORT || 8000;
-
-app.post("/check-transaction", async (req, res) => {
+// Sendbird webhook
+app.post("/sendbird-webhook", async (req, res) => {
   try {
-    const { transactionId } = req.body;
+    const event = req.body;
 
-    const transaction = await Transaction.findOne({ transactionId });
+    console.log("Webhook Event:", event.category);
 
-    if (!transaction) {
-      return res.json({
-        found: false,
-        message: "Transaction not found"
-      });
+    if (event.category === "group_channel:message_send") {
+
+      const userMessage = event.payload.message;
+      const channelUrl = event.payload.channel.channel_url;
+
+      if (event.payload.sender.user_id === "support_bot") {
+        return res.sendStatus(200);
+      }
+
+      const aiReply = await callDelightAI(userMessage);
+      await sendMessageAsBot(channelUrl, aiReply);
     }
 
-    if (transaction.status === "failed") {
-      return res.json({
-        found: true,
-        status: "failed",
-        escalate: true,
-        message: "Transaction failed. Escalation required."
-      });
-    }
-
-    return res.json({
-      found: true,
-      status: transaction.status,
-      escalate: false,
-      message: `Transaction is ${transaction.status}`
-    });
+    res.sendStatus(200);
 
   } catch (error) {
-    res.status(500).json({
-      error: "Error checking transaction"
-    });
+    console.error("Webhook error:", error);
+    res.sendStatus(500);
   }
 });
+
+// ===============================
+// 🔟 START SERVER (ONLY ONCE)
+// ===============================
+const PORT = process.env.PORT || 8000;
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
-
