@@ -92,6 +92,8 @@ async function createDeskTicket(channelUrl, senderId) {
   try {
     const authString = `${process.env.SENDBIRD_APP_ID}:${process.env.SENDBIRD_DESK_API_TOKEN}`;
     const encodedAuth = Buffer.from(authString).toString("base64");
+console.log("APP_ID:", process.env.SENDBIRD_APP_ID);
+console.log("DESK TOKEN LENGTH:", process.env.SENDBIRD_DESK_API_TOKEN?.length);
 
     await axios.post(
       `https://desk-api-${process.env.SENDBIRD_APP_ID}.sendbird.com/platform/v1/tickets`,
