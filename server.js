@@ -69,11 +69,11 @@ async function seedTransactions() {
 async function createDeskTicket(channelUrl) {
   try {
     await axios.post(
-      `https://desk-api.sendbird.com/v1/platform/${process.env.SENDBIRD_APP_ID}/tickets`,
+      `https://desk-api-${process.env.SENDBIRD_APP_ID}.sendbird.com/platform/v1/tickets`,
       {
         channel_url: channelUrl,
         subject: "Transaction Escalation",
-        priority: "medium"
+        priority: "MEDIUM"
       },
       {
         headers: {
@@ -86,7 +86,8 @@ async function createDeskTicket(channelUrl) {
     console.log("Desk ticket created successfully");
 
   } catch (error) {
-    console.error("Desk creation error:",
+    console.error(
+      "Desk creation error:",
       error.response?.data || error.message
     );
   }
