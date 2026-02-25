@@ -93,28 +93,11 @@ async function createHubSpotTicket(txnId, email) {
 // Desk Ticket
 // ===============================
 async function createDeskTicket(channelUrl, userId) {
-  
-  // Step 1: Create channel in Desk first
-  await axios.post(
-    `https://desk-api-${process.env.SENDBIRD_APP_ID}.sendbird.com/platform/v1/customers`,
-    {
-      sendbirdId: userId,
-      name: userId
-    },
-    {
-      headers: {
-        "SENDBIRDDESKAPITOKEN": process.env.SENDBIRDDESKAPITOKEN,
-        "Content-Type": "application/json"
-      }
-    }
-  );
-
-  // Step 2: Create the ticket
   await axios.post(
     `https://desk-api-${process.env.SENDBIRD_APP_ID}.sendbird.com/platform/v1/tickets`,
     {
-      channel_url: channelUrl,
-      channel_name: channelUrl,  // ✅ Add this
+      channelUrl: channelUrl,      // ✅ camelCase
+      channelName: channelUrl,     // ✅ camelCase - this was the missing field!
       subject: "Transaction Escalation",
       customer: {
         id: userId,
@@ -128,7 +111,6 @@ async function createDeskTicket(channelUrl, userId) {
       }
     }
   );
-
   console.log("Desk ticket created");
 }
 
