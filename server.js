@@ -35,7 +35,7 @@ mongoose.connect(MONGO_URI)
   .then(() => {
     console.log("MongoDB Connected");
     seedTransactions();
-    ensureBotUser(); // ✅ Ensure support_bot exists on startup
+    ensureBotUser();
   })
   .catch(err => console.error("Mongo Error:", err));
 
@@ -63,6 +63,28 @@ async function seedTransactions() {
       { transactionId: "TXN1003", amount: 300, status: "pending", userEmail: "rahul@test.com" }
     ]);
     console.log("Seed data inserted");
+  }
+}
+
+// ===============================
+// Ensure Bot User Exists
+// ===============================
+async function ensureBotUser() {
+  try {
+    await axios.get(
+      `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/users/support_bot`,
+      { headers: { "Api-Token": SENDBIRD_API_TOKEN } }
+    );
+    console.log("support_bot user exists");
+  } catch (err) {
+    if (err.response?.status === 400) {
+      await axios.post(
+        `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/users`,
+        { user_id: "support_bot", nickname: "Support Bot", profile_url: "" },
+        { headers: { "Api-Token": SENDBIRD_API_TOKEN, "Content-Type": "application/json" } }
+      );
+      console.log("support_bot user created");
+    }
   }
 }
 
@@ -98,10 +120,9 @@ async function createDeskTicket(channelUrl, userId) {
     "SENDBIRDDESKAPITOKEN": SENDBIRDDESKAPITOKEN,
     "Content-Type": "application/json"
   };
-
   const baseUrl = `https://desk-api-${SENDBIRD_APP_ID}.sendbird.com/platform/v1`;
 
-  // Step 1: Find or create Desk customer using sendbirdId
+  // Step 1: Find or create Desk customer
   let customerId;
   const searchRes = await axios.get(
     `${baseUrl}/customers?sendbird_id=${userId}`,
@@ -133,16 +154,15 @@ async function createDeskTicket(channelUrl, userId) {
   );
 
   const deskChannelUrl = ticketRes.data.channelUrl;
-  console.log("Desk ticket created successfully! Desk channel:", deskChannelUrl);
+  console.log("Desk ticket created! Desk channel:", deskChannelUrl);
 
-  // Step 3: Send initial message as the user in Desk channel
-  // This activates the ticket from INITIALIZED → PENDING so agents can see it
+  // Step 3: Send initial message as user to activate ticket INITIALIZED → PENDING
   await axios.post(
     `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/group_channels/${deskChannelUrl}/messages`,
     {
       message_type: "MESG",
       user_id: userId,
-      message: `Hi, I need help with my failed transaction. Channel ref: ${channelUrl}`
+      message: `Hi, I need help with my failed transaction. Ref: ${channelUrl}`
     },
     {
       headers: {
@@ -152,42 +172,6 @@ async function createDeskTicket(channelUrl, userId) {
     }
   );
   console.log("✅ Initial message sent in Desk channel — ticket is now PENDING");
-}
-
-// ===============================
-// Ensure Bot User Exists
-// ===============================
-async function ensureBotUser() {
-  try {
-    await axios.get(
-      `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/users/support_bot`,
-      {
-        headers: {
-          "Api-Token": SENDBIRD_API_TOKEN
-        }
-      }
-    );
-    console.log("support_bot user exists");
-  } catch (err) {
-    if (err.response?.status === 400) {
-      // User doesn't exist, create it
-      await axios.post(
-        `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/users`,
-        {
-          user_id: "support_bot",
-          nickname: "Support Bot",
-          profile_url: ""
-        },
-        {
-          headers: {
-            "Api-Token": SENDBIRD_API_TOKEN,
-            "Content-Type": "application/json"
-          }
-        }
-      );
-      console.log("support_bot user created");
-    }
-  }
 }
 
 // ===============================
@@ -231,7 +215,7 @@ async function sendBotMessage(channelUrl, message) {
 // Message Processor
 // ===============================
 const processedMessages = new Set();
-const escalatedChannels = new Set(); // ✅ Track channels already escalated
+const escalatedChannels = new Set();
 
 app.post("/sendbird-webhook", async (req, res) => {
   try {
@@ -265,21 +249,23 @@ app.post("/sendbird-webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // If this channel is already escalated, ignore further messages
-    if (escalatedChannels.has(channelUrl)) {
-      console.log("⏭️ Channel already escalated, skipping...");
-      return res.sendStatus(200);
-    }
-
     // Ignore Desk auto-generated channels
     if (channelUrl?.startsWith("sendbird_desk_")) {
       console.log("⏭️ Skipping Desk system channel message");
       return res.sendStatus(200);
     }
 
+    // Parse TXN ID first
+    const txnMatch = messageText?.match(/TXN\d+/i);
+
+    // If channel already escalated, only ignore non-TXN messages
+    if (escalatedChannels.has(channelUrl) && !txnMatch) {
+      console.log("⏭️ Channel already escalated, skipping...");
+      return res.sendStatus(200);
+    }
+
     if (!txnMatch) {
       console.log("No TXN ID found, asking user...");
-      escalatedChannels.add(channelUrl); // ✅ Mark channel as escalated
       await addBotToChannel(channelUrl);
       console.log("✅ Bot added, sending message...");
       await sendBotMessage(channelUrl, "Please provide your transaction ID (e.g., TXN1001).");
@@ -311,7 +297,7 @@ app.post("/sendbird-webhook", async (req, res) => {
         console.error("Desk failed but continuing:", err.response?.data || err.message);
       }
 
-      console.log("🤖 Adding bot and sending escalation message...");
+      escalatedChannels.add(channelUrl);
       await addBotToChannel(channelUrl);
       await sendBotMessage(
         channelUrl,
