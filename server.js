@@ -94,11 +94,11 @@ async function createHubSpotTicket(txnId, email) {
 // ===============================
 async function createDeskTicket(channelUrl, userId) {
   const headers = {
-    "SENDBIRDDESKAPITOKEN": process.env.SENDBIRDDESKAPITOKEN,
+    "SENDBIRDDESKAPITOKEN": SENDBIRDDESKAPITOKEN,
     "Content-Type": "application/json"
   };
 
-  const baseUrl = `https://desk-api-${process.env.SENDBIRD_APP_ID}.sendbird.com/platform/v1`;
+  const baseUrl = `https://desk-api-${SENDBIRD_APP_ID}.sendbird.com/platform/v1`;
 
   // Step 1: Find or create Desk customer using sendbirdId
   let customerId;
@@ -108,11 +108,9 @@ async function createDeskTicket(channelUrl, userId) {
   );
 
   if (searchRes.data.results && searchRes.data.results.length > 0) {
-    // Customer already exists in Desk
     customerId = searchRes.data.results[0].id;
     console.log("Existing Desk customer found:", customerId);
   } else {
-    // Create new Desk customer
     const createRes = await axios.post(
       `${baseUrl}/customers`,
       { sendbirdId: userId, displayName: userId },
@@ -122,17 +120,34 @@ async function createDeskTicket(channelUrl, userId) {
     console.log("New Desk customer created:", customerId);
   }
 
-  // Step 2: Create the ticket using the Desk customerId (integer)
+  // Step 2: Create the ticket
   await axios.post(
     `${baseUrl}/tickets`,
     {
-      channelName: `Support - ${userId}`,  // ✅ required - ticket title
-      customerId: customerId               // ✅ required - Desk internal integer ID
+      channelName: `Support - ${userId}`,
+      customerId: customerId
     },
     { headers }
   );
 
   console.log("Desk ticket created successfully!");
+}
+
+// ===============================
+// Add Bot to Channel
+// ===============================
+async function addBotToChannel(channelUrl) {
+  await axios.put(
+    `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/group_channels/${channelUrl}/members`,
+    { user_ids: ["support_bot"] },
+    {
+      headers: {
+        "Api-Token": SENDBIRD_API_TOKEN,
+        "Content-Type": "application/json"
+      }
+    }
+  );
+  console.log("Bot added to channel");
 }
 
 // ===============================
@@ -186,6 +201,7 @@ app.post("/sendbird-webhook", async (req, res) => {
     const txnMatch = messageText?.match(/TXN\d+/i);
 
     if (!txnMatch) {
+      await addBotToChannel(channelUrl);
       await sendBotMessage(channelUrl, "Please provide your transaction ID (e.g., TXN1001).");
       return res.sendStatus(200);
     }
@@ -194,29 +210,30 @@ app.post("/sendbird-webhook", async (req, res) => {
     const transaction = await Transaction.findOne({ transactionId: txnId });
 
     if (!transaction) {
+      await addBotToChannel(channelUrl);
       await sendBotMessage(channelUrl, `Transaction ${txnId} not found.`);
       return res.sendStatus(200);
     }
 
-if (transaction.status === "failed") {
+    if (transaction.status === "failed") {
+      await createHubSpotTicket(txnId, transaction.userEmail);
 
-  await createHubSpotTicket(txnId, transaction.userEmail);
+      try {
+        await createDeskTicket(channelUrl, senderId);
+      } catch (err) {
+        console.error("Desk failed but continuing:", err.response?.data || err.message);
+      }
 
-  // 🔥 Desk should not block chat
-  try {
-    await createDeskTicket(channelUrl, senderId);
-  } catch (err) {
-    console.error("Desk failed but continuing:", err.response?.data || err.message);
-  }
+      await addBotToChannel(channelUrl);
+      await sendBotMessage(
+        channelUrl,
+        `Transaction ${txnId} failed. Escalating to human support.`
+      );
 
-  await sendBotMessage(
-    channelUrl,
-    `Transaction ${txnId} failed. Escalating to human support.`
-  );
+      return res.sendStatus(200);
+    }
 
-  return res.sendStatus(200);
-}
-
+    await addBotToChannel(channelUrl);
     await sendBotMessage(channelUrl, `Transaction ${txnId} status: ${transaction.status}`);
     return res.sendStatus(200);
 
