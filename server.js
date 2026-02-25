@@ -154,6 +154,7 @@ async function createDeskTicket(channelUrl, userId) {
   );
 
   const deskChannelUrl = ticketRes.data.channelUrl;
+  deskChannels.add(deskChannelUrl); // ✅ Register Desk channel so webhook ignores it
   console.log("Desk ticket created! Desk channel:", deskChannelUrl);
 
   // Step 3: Send initial message as user to activate ticket INITIALIZED → PENDING
@@ -216,6 +217,7 @@ async function sendBotMessage(channelUrl, message) {
 // ===============================
 const processedMessages = new Set();
 const escalatedChannels = new Set();
+const deskChannels = new Set(); // ✅ Track Desk auto-generated channels
 
 app.post("/sendbird-webhook", async (req, res) => {
   try {
@@ -250,8 +252,8 @@ app.post("/sendbird-webhook", async (req, res) => {
     }
 
     // Ignore Desk auto-generated channels
-    if (channelUrl?.startsWith("sendbird_desk_")) {
-      console.log("⏭️ Skipping Desk system channel message");
+    if (channelUrl?.startsWith("sendbird_desk_") || deskChannels.has(channelUrl)) {
+      console.log("⏭️ Skipping Desk channel message");
       return res.sendStatus(200);
     }
 
