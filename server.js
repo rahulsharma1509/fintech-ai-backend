@@ -93,10 +93,6 @@ async function createHubSpotTicket(txnId, email) {
 // Desk Ticket
 // ===============================
 async function createDeskTicket(channelUrl, userId) {
-
-  const authString = `${process.env.SENDBIRDDESKAPITOKEN}:`;
-  const encodedAuth = Buffer.from(authString).toString("base64");
-
   await axios.post(
     `https://desk-api-${process.env.SENDBIRD_APP_ID}.sendbird.com/platform/v1/tickets`,
     {
@@ -109,12 +105,11 @@ async function createDeskTicket(channelUrl, userId) {
     },
     {
       headers: {
-        Authorization: `Basic ${encodedAuth}`,
+        "SENDBIRDDESKAPITOKEN": process.env.SENDBIRDDESKAPITOKEN,  // ✅ Correct
         "Content-Type": "application/json"
       }
     }
   );
-
   console.log("Desk ticket created");
 }
 
