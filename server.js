@@ -226,6 +226,8 @@ app.post("/sendbird-webhook", async (req, res) => {
     const channelUrl = event.channel?.channel_url;
     const senderId = event.sender?.user_id;
 
+    console.log("📩 Webhook received:", { messageId, senderId, channelUrl, messageText });
+
     if (!messageId || processedMessages.has(messageId)) {
       return res.sendStatus(200);
     }
@@ -239,40 +241,52 @@ app.post("/sendbird-webhook", async (req, res) => {
     const txnMatch = messageText?.match(/TXN\d+/i);
 
     if (!txnMatch) {
+      console.log("No TXN ID found, asking user...");
       await addBotToChannel(channelUrl);
+      console.log("✅ Bot added, sending message...");
       await sendBotMessage(channelUrl, "Please provide your transaction ID (e.g., TXN1001).");
+      console.log("✅ Message sent");
       return res.sendStatus(200);
     }
 
     const txnId = txnMatch[0].toUpperCase();
+    console.log("🔍 Looking up transaction:", txnId);
     const transaction = await Transaction.findOne({ transactionId: txnId });
 
     if (!transaction) {
+      console.log("❌ Transaction not found");
       await addBotToChannel(channelUrl);
       await sendBotMessage(channelUrl, `Transaction ${txnId} not found.`);
       return res.sendStatus(200);
     }
 
+    console.log("✅ Transaction found, status:", transaction.status);
+
     if (transaction.status === "failed") {
+      console.log("💳 Failed transaction, creating HubSpot ticket...");
       await createHubSpotTicket(txnId, transaction.userEmail);
 
+      console.log("🎫 Creating Desk ticket...");
       try {
         await createDeskTicket(channelUrl, senderId);
       } catch (err) {
         console.error("Desk failed but continuing:", err.response?.data || err.message);
       }
 
+      console.log("🤖 Adding bot and sending escalation message...");
       await addBotToChannel(channelUrl);
       await sendBotMessage(
         channelUrl,
         `Transaction ${txnId} failed. Escalating to human support.`
       );
-
+      console.log("✅ Done");
       return res.sendStatus(200);
     }
 
+    console.log("📤 Sending status message...");
     await addBotToChannel(channelUrl);
     await sendBotMessage(channelUrl, `Transaction ${txnId} status: ${transaction.status}`);
+    console.log("✅ Done");
     return res.sendStatus(200);
 
   } catch (error) {
