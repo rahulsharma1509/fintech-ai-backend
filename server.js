@@ -157,12 +157,29 @@ async function createDeskTicket(channelUrl, userId) {
   deskChannels.add(deskChannelUrl);
   console.log("Desk ticket created! Desk channel:", deskChannelUrl);
 
-  // Step 3: Send initial message as user to activate ticket INITIALIZED → PENDING
+  // Step 3: Fetch online agents and add them + customer to Desk channel
+  const agentIds = await getOnlineAgents();
+  const memberIds = [userId, ...agentIds];
+  console.log("Adding members to Desk channel:", memberIds);
+
+  await axios.put(
+    `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/group_channels/${deskChannelUrl}/members`,
+    { user_ids: memberIds },
+    {
+      headers: {
+        "Api-Token": SENDBIRD_API_TOKEN,
+        "Content-Type": "application/json"
+      }
+    }
+  );
+  console.log("✅ Members added to Desk channel");
+
+  // Step 4: Send initial message as the specific user to activate ticket
   await axios.post(
     `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/group_channels/${deskChannelUrl}/messages`,
     {
       message_type: "MESG",
-      user_id: userId,
+      user_id: userId,  // ✅ Dynamic — uses the actual customer's userId
       message: `Hi, I need help with my failed transaction. Ref: ${channelUrl}`
     },
     {
@@ -172,7 +189,22 @@ async function createDeskTicket(channelUrl, userId) {
       }
     }
   );
-  console.log("✅ Initial message sent in Desk channel — ticket is now PENDING");
+  console.log(`✅ Initial message sent in Desk channel for user: ${userId} — ticket is now PENDING`);
+}
+
+// ===============================
+// Get Online Desk Agents
+// ===============================
+async function getOnlineAgents() {
+  const res = await axios.get(
+    `https://desk-api-${SENDBIRD_APP_ID}.sendbird.com/platform/v1/agents?connection=ONLINE&status=ACTIVE&limit=100`,
+    {
+      headers: { "SENDBIRDDESKAPITOKEN": SENDBIRDDESKAPITOKEN }
+    }
+  );
+  const agents = res.data.results?.map(a => a.sendbirdId).filter(Boolean) || [];
+  console.log("🧑‍💼 Online agents found:", agents);
+  return agents;
 }
 
 // ===============================
