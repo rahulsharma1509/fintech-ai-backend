@@ -277,8 +277,6 @@ app.post("/sendbird-webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    const txnMatch = messageText?.match(/TXN\d+/i);
-
     if (!txnMatch) {
       console.log("No TXN ID found, asking user...");
       escalatedChannels.add(channelUrl); // ✅ Mark channel as escalated
