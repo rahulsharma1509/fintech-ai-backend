@@ -4,10 +4,35 @@ const express = require("express");
 const mongoose = require("mongoose");
 const axios = require("axios");
 const cors = require("cors");
+const rateLimit = require("express-rate-limit");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// ===============================
+// RATE LIMITING (hobby — strict)
+// ===============================
+
+// Global limiter: 60 requests per 15 minutes per IP
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests, please try again later." },
+});
+app.use(globalLimiter);
+
+// Webhook limiter: 120 requests per minute (Sendbird sends events, not humans)
+// This is tight enough to block any accidental flooding while allowing real events.
+const webhookLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Webhook rate limit exceeded." },
+});
 
 console.log("Starting server...");
 
@@ -287,7 +312,22 @@ async function sendBotMessage(channelUrl, message) {
 // ===============================
 // Message Processor
 // ===============================
-const processedMessages = new Set();
+
+// TTL-bounded dedup map — entries expire after 10 minutes so memory stays flat.
+const processedMessages = new Map(); // messageId -> timestamp
+const MSG_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+function isAlreadyProcessed(messageId) {
+  const now = Date.now();
+  // Evict expired entries on every check to keep the map small.
+  for (const [id, ts] of processedMessages) {
+    if (now - ts > MSG_TTL_MS) processedMessages.delete(id);
+  }
+  if (processedMessages.has(messageId)) return true;
+  processedMessages.set(messageId, now);
+  return false;
+}
+
 const escalatedChannels = new Set();
 const deskChannels = new Set();
 
@@ -301,7 +341,7 @@ async function loadEscalatedChannels() {
   console.log(`✅ Restored ${mappings.length} escalated channel mappings from DB`);
 }
 
-app.post("/sendbird-webhook", async (req, res) => {
+app.post("/sendbird-webhook", webhookLimiter, async (req, res) => {
   try {
     const event = req.body;
 
@@ -322,11 +362,9 @@ app.post("/sendbird-webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    if (!messageId || processedMessages.has(messageId)) {
+    if (!messageId || isAlreadyProcessed(messageId)) {
       return res.sendStatus(200);
     }
-
-    processedMessages.add(messageId);
 
     // Ignore bot's own messages
     if (senderId === "support_bot") {
