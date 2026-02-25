@@ -11,197 +11,138 @@ app.use(express.json());
 
 console.log("Starting server...");
 
-/* =====================================
-   GLOBAL STATE
-===================================== */
-let lastBotMessageTime = 0;
-const BOT_DELAY = 2000;
-const processedMessages = new Set();
+// ===============================
+// ENV VALIDATION
+// ===============================
+const {
+  PORT,
+  MONGO_URI,
+  SENDBIRD_APP_ID,
+  SENDBIRD_API_TOKEN,
+  SENDBIRDDESKAPITOKEN,
+  HUBSPOT_TOKEN
+} = process.env;
 
-/* =====================================
-   MONGODB CONNECTION
-===================================== */
-mongoose
-  .connect(process.env.MONGO_URI)
+if (!SENDBIRD_APP_ID || !SENDBIRD_API_TOKEN || !SENDBIRDDESKAPITOKEN) {
+  console.error("❌ Missing required environment variables");
+  process.exit(1);
+}
+
+// ===============================
+// MongoDB
+// ===============================
+mongoose.connect(MONGO_URI)
   .then(() => {
     console.log("MongoDB Connected");
     seedTransactions();
   })
-  .catch((err) => console.error("MongoDB Error:", err));
+  .catch(err => console.error("Mongo Error:", err));
 
-/* =====================================
-   TRANSACTION MODEL
-===================================== */
+// ===============================
+// Schema
+// ===============================
 const transactionSchema = new mongoose.Schema({
   transactionId: String,
   amount: Number,
   status: String,
-  userEmail: String,
+  userEmail: String
 });
 
 const Transaction = mongoose.model("Transaction", transactionSchema);
 
-/* =====================================
-   SEED DATA
-===================================== */
+// ===============================
+// Seed
+// ===============================
 async function seedTransactions() {
-  const existing = await Transaction.find();
-  if (existing.length === 0) {
+  const count = await Transaction.countDocuments();
+  if (count === 0) {
     await Transaction.insertMany([
       { transactionId: "TXN1001", amount: 500, status: "failed", userEmail: "rahul@test.com" },
       { transactionId: "TXN1002", amount: 1200, status: "success", userEmail: "rahul@test.com" },
-      { transactionId: "TXN1003", amount: 300, status: "pending", userEmail: "rahul@test.com" },
+      { transactionId: "TXN1003", amount: 300, status: "pending", userEmail: "rahul@test.com" }
     ]);
-    console.log("Dummy transactions inserted");
+    console.log("Seed data inserted");
   }
 }
 
-/* =====================================
-   HUBSPOT TICKET
-===================================== */
-async function createHubSpotTicket(txnId, userEmail) {
-  try {
-    await axios.post(
-      "https://api.hubapi.com/crm/v3/objects/tickets",
-      {
-        properties: {
-          subject: `Failed Transaction ${txnId}`,
-          content: `Transaction ${txnId} failed for ${userEmail}`,
-          hs_pipeline: "0",
-          hs_pipeline_stage: "1",
-        },
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.HUBSPOT_TOKEN}`,
-          "Content-Type": "application/json",
-        },
-      }
-    );
-
-    console.log("HubSpot ticket created");
-  } catch (err) {
-    console.error("HubSpot error:", err.response?.data || err.message);
-  }
-}
-
-/* =====================================
-   DESK TICKET
-===================================== */
-async function createDeskTicket(channelUrl, senderId) {
-  try {
-    const appId = process.env.SENDBIRD_APP_ID;
-    const token = process.env.SENDBIRD_DESK_API_TOKEN;
-
-    const encodedAuth = Buffer.from(`${token}:`).toString("base64");
-
-    console.log("Creating Desk ticket...");
-
-    const response = await axios.post(
-      `https://desk-api-${appId}.sendbird.com/platform/v1/tickets`,
-      {
-        channel_url: channelUrl,
-        subject: "Transaction Escalation",
-        customer: {
-          id: senderId,
-          name: senderId,
-        },
-      },
-      {
-        headers: {
-          Authorization: `Basic ${encodedAuth}`,
-          "X-Sendbird-Desk-App-Id": appId,
-          "Content-Type": "application/json",
-        },
-      }
-    );
-
-    console.log("Desk ticket created:", response.data.id);
-
-  } catch (err) {
-    console.error(
-      "Desk creation error:",
-      err.response?.status,
-      err.response?.data || err.message
-    );
-  }
-}
-
-/* =====================================
-   AI LOGIC
-===================================== */
-async function handleMessage(userMessage) {
-  const txnMatch = userMessage.match(/TXN\d+/i);
-
-  if (!txnMatch) {
-    return {
-      message: "Please provide your transaction ID (e.g., TXN1001).",
-      escalate: false,
-    };
-  }
-
-  const txnId = txnMatch[0].toUpperCase();
-
-  const transaction = await Transaction.findOne({
-    transactionId: txnId,
-  });
-
-  if (!transaction) {
-    return {
-      message: `Transaction ${txnId} not found.`,
-      escalate: false,
-    };
-  }
-
-  if (transaction.status === "failed") {
-    await createHubSpotTicket(txnId, transaction.userEmail);
-
-    return {
-      message: `Transaction ${txnId} failed. Escalating to human support.`,
-      escalate: true,
-    };
-  }
-
-  return {
-    message: `Transaction ${txnId} status: ${transaction.status}`,
-    escalate: false,
-  };
-}
-
-/* =====================================
-   SEND MESSAGE AS BOT
-===================================== */
-async function sendMessageAsBot(channelUrl, message) {
-  const now = Date.now();
-  const diff = now - lastBotMessageTime;
-
-  if (diff < BOT_DELAY) {
-    await new Promise((resolve) =>
-      setTimeout(resolve, BOT_DELAY - diff)
-    );
-  }
-
+// ===============================
+// HubSpot
+// ===============================
+async function createHubSpotTicket(txnId, email) {
   await axios.post(
-    `https://api-${process.env.SENDBIRD_APP_ID}.sendbird.com/v3/group_channels/${channelUrl}/messages`,
+    "https://api.hubapi.com/crm/v3/objects/tickets",
     {
-      message_type: "MESG",
-      user_id: "support_bot",
-      message,
+      properties: {
+        subject: `Failed Transaction ${txnId}`,
+        content: `Transaction ${txnId} failed for ${email}`,
+        hs_pipeline: "0",
+        hs_pipeline_stage: "1"
+      }
     },
     {
       headers: {
-        "Api-Token": process.env.SENDBIRD_API_TOKEN,
-        "Content-Type": "application/json",
-      },
+        Authorization: `Bearer ${HUBSPOT_TOKEN}`,
+        "Content-Type": "application/json"
+      }
+    }
+  );
+  console.log("HubSpot ticket created");
+}
+
+// ===============================
+// Desk Ticket
+// ===============================
+async function createDeskTicket(channelUrl, userId) {
+
+  const authString = `${SENDBIRD_APP_ID}:${SENDBIRDDESKAPITOKEN}`;
+  const encodedAuth = Buffer.from(authString).toString("base64");
+
+  await axios.post(
+    `https://desk-api-${SENDBIRD_APP_ID}.sendbird.com/platform/v1/tickets`,
+    {
+      channel_url: channelUrl,
+      subject: "Transaction Escalation",
+      customer: {
+        id: userId,
+        name: userId
+      }
+    },
+    {
+      headers: {
+        Authorization: `Basic ${encodedAuth}`,
+        "Content-Type": "application/json"
+      }
     }
   );
 
-  lastBotMessageTime = Date.now();
+  console.log("Desk ticket created");
 }
 
-/* =====================================
-   WEBHOOK
-===================================== */
+// ===============================
+// Send message as bot
+// ===============================
+async function sendBotMessage(channelUrl, message) {
+  await axios.post(
+    `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/group_channels/${channelUrl}/messages`,
+    {
+      message_type: "MESG",
+      user_id: "support_bot",
+      message
+    },
+    {
+      headers: {
+        "Api-Token": SENDBIRD_API_TOKEN,
+        "Content-Type": "application/json"
+      }
+    }
+  );
+}
+
+// ===============================
+// Message Processor
+// ===============================
+const processedMessages = new Set();
+
 app.post("/sendbird-webhook", async (req, res) => {
   try {
     const event = req.body;
@@ -211,15 +152,11 @@ app.post("/sendbird-webhook", async (req, res) => {
     }
 
     const messageId = event.payload?.message_id;
-    const userMessage = event.payload?.message;
+    const messageText = event.payload?.message;
     const channelUrl = event.channel?.channel_url;
     const senderId = event.sender?.user_id;
 
-    if (!messageId || !userMessage || !channelUrl || !senderId) {
-      return res.sendStatus(200);
-    }
-
-    if (processedMessages.has(messageId)) {
+    if (!messageId || processedMessages.has(messageId)) {
       return res.sendStatus(200);
     }
 
@@ -229,33 +166,45 @@ app.post("/sendbird-webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    const response = await handleMessage(userMessage);
+    const txnMatch = messageText?.match(/TXN\d+/i);
 
-    await sendMessageAsBot(channelUrl, response.message);
-
-    if (response.escalate) {
-      await createDeskTicket(channelUrl, senderId);
+    if (!txnMatch) {
+      await sendBotMessage(channelUrl, "Please provide your transaction ID (e.g., TXN1001).");
+      return res.sendStatus(200);
     }
 
+    const txnId = txnMatch[0].toUpperCase();
+    const transaction = await Transaction.findOne({ transactionId: txnId });
+
+    if (!transaction) {
+      await sendBotMessage(channelUrl, `Transaction ${txnId} not found.`);
+      return res.sendStatus(200);
+    }
+
+    if (transaction.status === "failed") {
+
+      await createHubSpotTicket(txnId, transaction.userEmail);
+      await createDeskTicket(channelUrl, senderId);
+
+      await sendBotMessage(channelUrl, `Transaction ${txnId} failed. Escalating to human support.`);
+
+      return res.sendStatus(200);
+    }
+
+    await sendBotMessage(channelUrl, `Transaction ${txnId} status: ${transaction.status}`);
     return res.sendStatus(200);
+
   } catch (error) {
     console.error("Webhook error:", error.response?.data || error.message);
     return res.sendStatus(500);
   }
 });
 
-/* =====================================
-   HEALTH
-===================================== */
+// ===============================
 app.get("/", (req, res) => {
-  res.send("Fintech Backend Running 🚀");
+  res.send("Backend running 🚀");
 });
 
-/* =====================================
-   START SERVER
-===================================== */
-const PORT = process.env.PORT || 8000;
-
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+app.listen(PORT || 8000, () => {
+  console.log(`Server running on port ${PORT || 8000}`);
 });
