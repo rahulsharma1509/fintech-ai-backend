@@ -228,13 +228,26 @@ app.post("/sendbird-webhook", async (req, res) => {
 
     console.log("📩 Webhook received:", { messageId, senderId, channelUrl, messageText });
 
+    // Ignore system messages with no sender
+    if (!senderId) {
+      console.log("⏭️ Skipping system message with no sender");
+      return res.sendStatus(200);
+    }
+
     if (!messageId || processedMessages.has(messageId)) {
       return res.sendStatus(200);
     }
 
     processedMessages.add(messageId);
 
+    // Ignore bot's own messages
     if (senderId === "support_bot") {
+      return res.sendStatus(200);
+    }
+
+    // Ignore Desk auto-generated channels
+    if (channelUrl?.startsWith("sendbird_desk_")) {
+      console.log("⏭️ Skipping Desk system channel message");
       return res.sendStatus(200);
     }
 
