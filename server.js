@@ -122,17 +122,36 @@ async function createDeskTicket(channelUrl, userId) {
   }
 
   // Step 2: Create the ticket
-  await axios.post(
+  const ticketRes = await axios.post(
     `${baseUrl}/tickets`,
     {
       channelName: `Support - ${userId}`,
       customerId: customerId,
-      relatedChannelUrls: channelUrl  // ✅ Links your existing chat channel to the ticket
+      relatedChannelUrls: channelUrl
     },
     { headers }
   );
 
-  console.log("Desk ticket created successfully!");
+  const deskChannelUrl = ticketRes.data.channelUrl;
+  console.log("Desk ticket created successfully! Desk channel:", deskChannelUrl);
+
+  // Step 3: Send initial message as the user in Desk channel
+  // This activates the ticket from INITIALIZED → PENDING so agents can see it
+  await axios.post(
+    `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/group_channels/${deskChannelUrl}/messages`,
+    {
+      message_type: "MESG",
+      user_id: userId,
+      message: `Hi, I need help with my failed transaction. Channel ref: ${channelUrl}`
+    },
+    {
+      headers: {
+        "Api-Token": SENDBIRD_API_TOKEN,
+        "Content-Type": "application/json"
+      }
+    }
+  );
+  console.log("✅ Initial message sent in Desk channel — ticket is now PENDING");
 }
 
 // ===============================
@@ -212,6 +231,7 @@ async function sendBotMessage(channelUrl, message) {
 // Message Processor
 // ===============================
 const processedMessages = new Set();
+const escalatedChannels = new Set(); // ✅ Track channels already escalated
 
 app.post("/sendbird-webhook", async (req, res) => {
   try {
@@ -245,6 +265,12 @@ app.post("/sendbird-webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
+    // If this channel is already escalated, ignore further messages
+    if (escalatedChannels.has(channelUrl)) {
+      console.log("⏭️ Channel already escalated, skipping...");
+      return res.sendStatus(200);
+    }
+
     // Ignore Desk auto-generated channels
     if (channelUrl?.startsWith("sendbird_desk_")) {
       console.log("⏭️ Skipping Desk system channel message");
@@ -255,6 +281,7 @@ app.post("/sendbird-webhook", async (req, res) => {
 
     if (!txnMatch) {
       console.log("No TXN ID found, asking user...");
+      escalatedChannels.add(channelUrl); // ✅ Mark channel as escalated
       await addBotToChannel(channelUrl);
       console.log("✅ Bot added, sending message...");
       await sendBotMessage(channelUrl, "Please provide your transaction ID (e.g., TXN1001).");
