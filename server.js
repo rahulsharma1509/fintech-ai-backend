@@ -138,34 +138,52 @@ async function createDeskTicket(channelUrl, userId) {
 
   // Step 1: Find or create Desk customer
   let customerId;
-  const searchRes = await axios.get(
-    `${baseUrl}/customers?sendbird_id=${userId}`,
-    { headers }
-  );
+  let searchRes;
+  try {
+    searchRes = await axios.get(
+      `${baseUrl}/customers?sendbird_id=${userId}`,
+      { headers }
+    );
+    console.log("🔍 Desk customer search response:", JSON.stringify(searchRes.data));
+  } catch (err) {
+    console.error("❌ Desk customer search failed:", err.response?.status, JSON.stringify(err.response?.data) || err.message);
+    throw err;
+  }
 
   if (searchRes.data.results && searchRes.data.results.length > 0) {
     customerId = searchRes.data.results[0].id;
     console.log("Existing Desk customer found:", customerId);
   } else {
-    const createRes = await axios.post(
-      `${baseUrl}/customers`,
-      { sendbirdId: userId, displayName: userId },
-      { headers }
-    );
-    customerId = createRes.data.id;
-    console.log("New Desk customer created:", customerId);
+    try {
+      const createRes = await axios.post(
+        `${baseUrl}/customers`,
+        { sendbirdId: userId, displayName: userId },
+        { headers }
+      );
+      customerId = createRes.data.id;
+      console.log("New Desk customer created:", customerId);
+    } catch (err) {
+      console.error("❌ Desk customer creation failed:", err.response?.status, JSON.stringify(err.response?.data) || err.message);
+      throw err;
+    }
   }
 
   // Step 2: Create the ticket
-  const ticketRes = await axios.post(
-    `${baseUrl}/tickets`,
-    {
-      channelName: `Support - ${userId}`,
-      customerId: customerId,
-      relatedChannelUrls: [channelUrl]
-    },
-    { headers }
-  );
+  let ticketRes;
+  try {
+    ticketRes = await axios.post(
+      `${baseUrl}/tickets`,
+      {
+        channelName: `Support - ${userId}`,
+        customerId: customerId
+      },
+      { headers }
+    );
+    console.log("🎫 Desk ticket creation response:", JSON.stringify(ticketRes.data));
+  } catch (err) {
+    console.error("❌ Desk ticket creation failed:", err.response?.status, JSON.stringify(err.response?.data) || err.message);
+    throw err;
+  }
 
   const deskChannelUrl = ticketRes.data.channelUrl;
   deskChannels.add(deskChannelUrl);

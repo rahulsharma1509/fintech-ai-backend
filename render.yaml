@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: fintech-ai-backend
+    env: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: MONGO_URI
+        sync: false
+      - key: SENDBIRD_APP_ID
+        sync: false
+      - key: SENDBIRD_API_TOKEN
+        sync: false
+      - key: SENDBIRDDESKAPITOKEN
+        sync: false
+      - key: HUBSPOT_TOKEN
+        sync: false
