@@ -36,6 +36,7 @@ mongoose.connect(MONGO_URI)
     console.log("MongoDB Connected");
     seedTransactions();
     ensureBotUser();
+    loadEscalatedChannels();
   })
   .catch(err => console.error("Mongo Error:", err));
 
@@ -50,6 +51,19 @@ const transactionSchema = new mongoose.Schema({
 });
 
 const Transaction = mongoose.model("Transaction", transactionSchema);
+
+// ===============================
+// Channel Mapping Schema
+// Maps Desk ticket channel → original customer channel
+// ===============================
+const channelMappingSchema = new mongoose.Schema({
+  deskChannelUrl: { type: String, unique: true },
+  originalChannelUrl: String,
+  userId: String,
+  createdAt: { type: Date, default: Date.now }
+});
+
+const ChannelMapping = mongoose.model("ChannelMapping", channelMappingSchema);
 
 // ===============================
 // Seed
@@ -148,7 +162,7 @@ async function createDeskTicket(channelUrl, userId) {
     {
       channelName: `Support - ${userId}`,
       customerId: customerId,
-      relatedChannelUrls: channelUrl
+      relatedChannelUrls: [channelUrl]
     },
     { headers }
   );
@@ -156,6 +170,14 @@ async function createDeskTicket(channelUrl, userId) {
   const deskChannelUrl = ticketRes.data.channelUrl;
   deskChannels.add(deskChannelUrl);
   console.log("Desk ticket created! Desk channel:", deskChannelUrl);
+
+  // Persist the mapping so agent replies can be routed back to the customer
+  await ChannelMapping.findOneAndUpdate(
+    { deskChannelUrl },
+    { deskChannelUrl, originalChannelUrl: channelUrl, userId },
+    { upsert: true, new: true }
+  );
+  console.log("✅ Channel mapping saved to DB");
 
   // Step 3: Fetch online agents and add them + customer to Desk channel
   const agentIds = await getOnlineAgents();
@@ -225,16 +247,12 @@ async function addBotToChannel(channelUrl) {
 }
 
 // ===============================
-// Send message as bot
+// Send message as any user (or bot)
 // ===============================
-async function sendBotMessage(channelUrl, message) {
+async function sendChannelMessage(channelUrl, userId, message) {
   await axios.post(
     `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/group_channels/${channelUrl}/messages`,
-    {
-      message_type: "MESG",
-      user_id: "support_bot",
-      message
-    },
+    { message_type: "MESG", user_id: userId, message },
     {
       headers: {
         "Api-Token": SENDBIRD_API_TOKEN,
@@ -244,12 +262,26 @@ async function sendBotMessage(channelUrl, message) {
   );
 }
 
+async function sendBotMessage(channelUrl, message) {
+  await sendChannelMessage(channelUrl, "support_bot", message);
+}
+
 // ===============================
 // Message Processor
 // ===============================
 const processedMessages = new Set();
 const escalatedChannels = new Set();
 const deskChannels = new Set();
+
+// Reload escalated/desk channel sets from DB so state survives server restarts
+async function loadEscalatedChannels() {
+  const mappings = await ChannelMapping.find({}, "originalChannelUrl deskChannelUrl");
+  mappings.forEach(m => {
+    escalatedChannels.add(m.originalChannelUrl);
+    deskChannels.add(m.deskChannelUrl);
+  });
+  console.log(`✅ Restored ${mappings.length} escalated channel mappings from DB`);
+}
 
 app.post("/sendbird-webhook", async (req, res) => {
   try {
@@ -283,24 +315,36 @@ app.post("/sendbird-webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // Ignore Desk auto-generated channels
+    // Handle Desk channel messages — forward agent replies to the original customer channel
     if (channelUrl?.startsWith("sendbird_desk_") || deskChannels.has(channelUrl)) {
-      console.log("⏭️ Skipping Desk channel message");
+      const mapping = await ChannelMapping.findOne({ deskChannelUrl: channelUrl });
+      if (mapping && senderId !== mapping.userId) {
+        // Agent (or anyone who is not the customer) sent a message — relay it to the customer
+        console.log(`📨 Forwarding agent message to customer channel: ${mapping.originalChannelUrl}`);
+        await sendBotMessage(
+          mapping.originalChannelUrl,
+          `[Support Agent]: ${messageText}`
+        );
+      }
       return res.sendStatus(200);
     }
 
-    // Ignore agent messages from Desk
+    // Ignore agent messages arriving outside of a Desk channel (safety guard)
     if (senderId?.startsWith("sendbird_desk_agent_id_")) {
-      console.log("⏭️ Skipping Desk agent message");
+      console.log("⏭️ Skipping Desk agent message outside Desk channel");
       return res.sendStatus(200);
     }
 
     // Parse TXN ID first
     const txnMatch = messageText?.match(/TXN\d+/i);
 
-    // If channel already escalated, only ignore non-TXN messages
+    // If channel already escalated, forward customer follow-ups to the Desk channel
     if (escalatedChannels.has(channelUrl) && !txnMatch) {
-      console.log("⏭️ Channel already escalated, skipping...");
+      const mapping = await ChannelMapping.findOne({ originalChannelUrl: channelUrl });
+      if (mapping) {
+        console.log(`📨 Forwarding customer follow-up to Desk channel: ${mapping.deskChannelUrl}`);
+        await sendChannelMessage(mapping.deskChannelUrl, senderId, messageText);
+      }
       return res.sendStatus(200);
     }
 
