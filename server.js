@@ -181,15 +181,24 @@ app.post("/sendbird-webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    if (transaction.status === "failed") {
+if (transaction.status === "failed") {
 
-      await createHubSpotTicket(txnId, transaction.userEmail);
-      await createDeskTicket(channelUrl, senderId);
+  await createHubSpotTicket(txnId, transaction.userEmail);
 
-      await sendBotMessage(channelUrl, `Transaction ${txnId} failed. Escalating to human support.`);
+  // 🔥 Desk should not block chat
+  try {
+    await createDeskTicket(channelUrl, senderId);
+  } catch (err) {
+    console.error("Desk failed but continuing:", err.response?.data || err.message);
+  }
 
-      return res.sendStatus(200);
-    }
+  await sendBotMessage(
+    channelUrl,
+    `Transaction ${txnId} failed. Escalating to human support.`
+  );
+
+  return res.sendStatus(200);
+}
 
     await sendBotMessage(channelUrl, `Transaction ${txnId} status: ${transaction.status}`);
     return res.sendStatus(200);
