@@ -35,6 +35,7 @@ mongoose.connect(MONGO_URI)
   .then(() => {
     console.log("MongoDB Connected");
     seedTransactions();
+    ensureBotUser(); // ✅ Ensure support_bot exists on startup
   })
   .catch(err => console.error("Mongo Error:", err));
 
@@ -125,12 +126,49 @@ async function createDeskTicket(channelUrl, userId) {
     `${baseUrl}/tickets`,
     {
       channelName: `Support - ${userId}`,
-      customerId: customerId
+      customerId: customerId,
+      relatedChannelUrls: channelUrl  // ✅ Links your existing chat channel to the ticket
     },
     { headers }
   );
 
   console.log("Desk ticket created successfully!");
+}
+
+// ===============================
+// Ensure Bot User Exists
+// ===============================
+async function ensureBotUser() {
+  try {
+    await axios.get(
+      `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/users/support_bot`,
+      {
+        headers: {
+          "Api-Token": SENDBIRD_API_TOKEN
+        }
+      }
+    );
+    console.log("support_bot user exists");
+  } catch (err) {
+    if (err.response?.status === 400) {
+      // User doesn't exist, create it
+      await axios.post(
+        `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/users`,
+        {
+          user_id: "support_bot",
+          nickname: "Support Bot",
+          profile_url: ""
+        },
+        {
+          headers: {
+            "Api-Token": SENDBIRD_API_TOKEN,
+            "Content-Type": "application/json"
+          }
+        }
+      );
+      console.log("support_bot user created");
+    }
+  }
 }
 
 // ===============================
