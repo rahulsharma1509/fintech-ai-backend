@@ -93,25 +93,46 @@ async function createHubSpotTicket(txnId, email) {
 // Desk Ticket
 // ===============================
 async function createDeskTicket(channelUrl, userId) {
-  await axios.post(
-    `https://desk-api-${process.env.SENDBIRD_APP_ID}.sendbird.com/platform/v1/tickets`,
-    {
-      channelUrl: channelUrl,      // ✅ camelCase
-      channelName: channelUrl,     // ✅ camelCase - this was the missing field!
-      subject: "Transaction Escalation",
-      customer: {
-        id: userId,
-        name: userId
-      }
-    },
-    {
-      headers: {
-        "SENDBIRDDESKAPITOKEN": process.env.SENDBIRDDESKAPITOKEN,
-        "Content-Type": "application/json"
-      }
-    }
+  const headers = {
+    "SENDBIRDDESKAPITOKEN": process.env.SENDBIRDDESKAPITOKEN,
+    "Content-Type": "application/json"
+  };
+
+  const baseUrl = `https://desk-api-${process.env.SENDBIRD_APP_ID}.sendbird.com/platform/v1`;
+
+  // Step 1: Find or create Desk customer using sendbirdId
+  let customerId;
+  const searchRes = await axios.get(
+    `${baseUrl}/customers?sendbird_id=${userId}`,
+    { headers }
   );
-  console.log("Desk ticket created");
+
+  if (searchRes.data.results && searchRes.data.results.length > 0) {
+    // Customer already exists in Desk
+    customerId = searchRes.data.results[0].id;
+    console.log("Existing Desk customer found:", customerId);
+  } else {
+    // Create new Desk customer
+    const createRes = await axios.post(
+      `${baseUrl}/customers`,
+      { sendbirdId: userId, displayName: userId },
+      { headers }
+    );
+    customerId = createRes.data.id;
+    console.log("New Desk customer created:", customerId);
+  }
+
+  // Step 2: Create the ticket using the Desk customerId (integer)
+  await axios.post(
+    `${baseUrl}/tickets`,
+    {
+      channelName: `Support - ${userId}`,  // ✅ required - ticket title
+      customerId: customerId               // ✅ required - Desk internal integer ID
+    },
+    { headers }
+  );
+
+  console.log("Desk ticket created successfully!");
 }
 
 // ===============================
