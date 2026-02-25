@@ -91,6 +91,19 @@ const channelMappingSchema = new mongoose.Schema({
 const ChannelMapping = mongoose.model("ChannelMapping", channelMappingSchema);
 
 // ===============================
+// Registered User Schema
+// Tracks unique users to enforce the 20-user hard limit
+// ===============================
+const registeredUserSchema = new mongoose.Schema({
+  userId: { type: String, unique: true },
+  createdAt: { type: Date, default: Date.now }
+});
+
+const RegisteredUser = mongoose.model("RegisteredUser", registeredUserSchema);
+
+const USER_LIMIT = 20;
+
+// ===============================
 // Seed
 // ===============================
 async function seedTransactions() {
@@ -456,6 +469,46 @@ app.post("/sendbird-webhook", webhookLimiter, async (req, res) => {
   } catch (error) {
     console.error("Webhook error:", error.response?.data || error.message);
     return res.sendStatus(500);
+  }
+});
+
+// ===============================
+// User Registration / Limit Check
+// ===============================
+app.post("/register-user", async (req, res) => {
+  try {
+    const { userId } = req.body;
+    if (!userId || typeof userId !== "string" || !userId.trim()) {
+      return res.status(400).json({ error: "userId is required" });
+    }
+
+    const id = userId.trim();
+
+    // Always allow system users through
+    if (id === "support_bot") {
+      return res.json({ allowed: true });
+    }
+
+    // If already registered, let them in
+    const existing = await RegisteredUser.findOne({ userId: id });
+    if (existing) {
+      return res.json({ allowed: true });
+    }
+
+    // New user — check the limit
+    const count = await RegisteredUser.countDocuments();
+    if (count >= USER_LIMIT) {
+      return res.status(403).json({
+        allowed: false,
+        message: `This app has reached its ${USER_LIMIT}-user limit. Please contact support to get access.`
+      });
+    }
+
+    await RegisteredUser.create({ userId: id });
+    return res.status(201).json({ allowed: true });
+  } catch (err) {
+    console.error("register-user error:", err.message);
+    return res.status(500).json({ error: "Internal server error" });
   }
 });
 
