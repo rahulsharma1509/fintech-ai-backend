@@ -617,6 +617,44 @@ app.post("/retry-payment", async (req, res) => {
 });
 
 // ----------------------------------------------------------
+// POST /escalate
+// Called directly by the "Talk to Agent" button on the frontend.
+// Creates a Desk ticket immediately without relying on webhook intent detection.
+//
+// Body: { channelUrl, userId }
+// Response: { success, message }
+// ----------------------------------------------------------
+app.post("/escalate", async (req, res) => {
+  try {
+    const { channelUrl, userId } = req.body;
+    if (!channelUrl || !userId) {
+      return res.status(400).json({ error: "channelUrl and userId are required" });
+    }
+
+    await addBotToChannel(channelUrl);
+
+    if (escalatedChannels.has(channelUrl)) {
+      await sendBotMessage(channelUrl, "You already have an open support ticket. An agent will be with you shortly.");
+      return res.json({ success: true, message: "Already escalated" });
+    }
+
+    try {
+      await createDeskTicket(channelUrl, userId);
+      escalatedChannels.add(channelUrl);
+      await sendBotMessage(channelUrl, "Connecting you with a human agent... A support ticket has been created and an agent will join shortly.");
+    } catch (err) {
+      console.error("Desk ticket creation failed:", err.message);
+      await sendBotMessage(channelUrl, "We're having trouble connecting you right now. Please try again in a moment or email support directly.");
+      return res.status(500).json({ error: "Failed to create support ticket" });
+    }
+
+    return res.json({ success: true });
+  } catch (err) {
+    return handleError(res, err, "escalate");
+  }
+});
+
+// ----------------------------------------------------------
 // POST /payment-webhook
 // Stripe calls this after a successful checkout.session.completed event.
 // Verifies the Stripe signature, updates the transaction to "success", and
