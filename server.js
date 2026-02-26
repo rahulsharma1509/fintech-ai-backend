@@ -894,8 +894,11 @@ const healthHandler = (_req, res) => {
   res.json({
     status: "ok",
     service: "fintech-ai-backend",
-    redis: redisClient ? "connected" : "in-memory fallback",
     stripe: stripe ? "configured" : "not configured (demo mode)",
+    sendbird_app_id: SENDBIRD_APP_ID ? "set" : "MISSING ⚠️",
+    sendbird_api_token: SENDBIRD_API_TOKEN ? "set" : "MISSING ⚠️",
+    sendbird_desk_token: SENDBIRDDESKAPITOKEN ? "set" : "MISSING ⚠️ — desk ticket creation will fail",
+    mongodb: mongoose.connection.readyState === 1 ? "connected" : "disconnected",
   });
 };
 app.get("/", healthHandler);
