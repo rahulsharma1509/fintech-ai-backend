@@ -413,7 +413,8 @@ async function createDeskTicket(channelUrl, userId) {
     console.error("⚠️ Channel mapping save failed (non-fatal):", err.message);
   }
 
-  // Step 3: Add agents + customer to the Desk channel (non-fatal — ticket already created)
+  // Step 3: Add customer + agents to the Desk channel.
+  // Customer must be added first so the activation message counts as a member message.
   let agentIds = [];
   try {
     agentIds = await getOnlineAgents();
@@ -434,21 +435,19 @@ async function createDeskTicket(channelUrl, userId) {
     console.error("⚠️ Adding members to Desk channel failed (non-fatal):", err.response?.status, err.message);
   }
 
-  // Step 4: Send initial message to activate the Desk ticket (non-fatal)
-  try {
-    await axios.post(
-      `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/group_channels/${deskChannelUrl}/messages`,
-      {
-        message_type: "MESG",
-        user_id: userId,
-        message: `Hi, I need help with my failed transaction. Ref: ${channelUrl}`,
-      },
-      { headers: { "Api-Token": SENDBIRD_API_TOKEN, "Content-Type": "application/json" } }
-    );
-    console.log(`✅ Initial message sent in Desk channel for user: ${userId}`);
-  } catch (err) {
-    console.error("⚠️ Initial Desk message failed (non-fatal):", err.response?.status, err.message);
-  }
+  // Step 4: Send initial message from the customer to activate the ticket.
+  // Until a customer message arrives the ticket stays in INITIALIZED status
+  // and is invisible to agents in the Desk dashboard. This step is CRITICAL.
+  await axios.post(
+    `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/group_channels/${deskChannelUrl}/messages`,
+    {
+      message_type: "MESG",
+      user_id: userId,
+      message: `Hi, I need help with my failed payment. Original channel: ${channelUrl}`,
+    },
+    { headers: { "Api-Token": SENDBIRD_API_TOKEN, "Content-Type": "application/json" } }
+  );
+  console.log(`✅ Activation message sent — ticket should now be UNASSIGNED/visible to agents`);
 
   return { ticketId, deskChannelUrl };
 }
