@@ -651,8 +651,31 @@ app.post("/escalate", async (req, res) => {
     await addBotToChannel(channelUrl);
 
     if (escalatedChannels.has(channelUrl)) {
-      await sendBotMessage(channelUrl, "You already have an open support ticket. An agent will be with you shortly.");
-      return res.json({ success: true, message: "Already escalated" });
+      // Verify a real Desk channel still exists in the DB for this channel.
+      // If the mapping is stale (previous run failed partway) or the Desk
+      // channel was deleted, clear the flag and fall through to re-create.
+      const mapping = await ChannelMapping.findOne({ originalChannelUrl: channelUrl });
+      if (mapping) {
+        try {
+          // Confirm the Sendbird channel referenced by the mapping still exists.
+          await axios.get(
+            `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/group_channels/${mapping.deskChannelUrl}`,
+            { headers: { "Api-Token": SENDBIRD_API_TOKEN } }
+          );
+          // Channel exists — ticket is live.
+          await sendBotMessage(channelUrl, "You already have an open support ticket. An agent will be with you shortly.");
+          return res.json({ success: true, message: "Already escalated" });
+        } catch {
+          // Desk channel gone — delete stale mapping and re-escalate.
+          console.warn("⚠️ Stale Desk mapping found — Desk channel no longer exists. Re-escalating.");
+          await ChannelMapping.deleteOne({ originalChannelUrl: channelUrl });
+          escalatedChannels.delete(channelUrl);
+        }
+      } else {
+        // In-memory flag set but no DB record — clear stale flag and re-escalate.
+        console.warn("⚠️ escalatedChannels has channel but no DB mapping — clearing stale state.");
+        escalatedChannels.delete(channelUrl);
+      }
     }
 
     try {
@@ -895,6 +918,8 @@ const healthHandler = (_req, res) => {
     status: "ok",
     service: "fintech-ai-backend",
     stripe: stripe ? "configured" : "not configured (demo mode)",
+    stripe_webhook_secret: STRIPE_WEBHOOK_SECRET ? "set" : "MISSING ⚠️ — MongoDB won't update after payment",
+    frontend_url: FRONTEND_URL || "MISSING ⚠️ — Stripe redirects to localhost:3000 instead of your app",
     sendbird_app_id: SENDBIRD_APP_ID ? "set" : "MISSING ⚠️",
     sendbird_api_token: SENDBIRD_API_TOKEN ? "set" : "MISSING ⚠️",
     sendbird_desk_token: SENDBIRDDESKAPITOKEN ? "set" : "MISSING ⚠️ — desk ticket creation will fail",
