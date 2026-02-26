@@ -662,8 +662,13 @@ app.post("/escalate", async (req, res) => {
             `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/group_channels/${mapping.deskChannelUrl}`,
             { headers: { "Api-Token": SENDBIRD_API_TOKEN } }
           );
-          // Channel exists — ticket is live.
-          await sendBotMessage(channelUrl, "You already have an open support ticket. An agent will be with you shortly.");
+          // Channel exists — ticket is live. Include the Desk channel URL so
+          // the agent can find the unassigned ticket in the Desk dashboard.
+          await sendBotMessage(
+            channelUrl,
+            `Your support ticket is already open (Desk channel: ${mapping.deskChannelUrl}). ` +
+            `An agent will join shortly — if no one has responded, ask your Sendbird Desk admin to check the "New" or "All Tickets" view for unassigned tickets.`
+          );
           return res.json({ success: true, message: "Already escalated" });
         } catch {
           // Desk channel gone — delete stale mapping and re-escalate.
