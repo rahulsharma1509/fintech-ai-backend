@@ -397,14 +397,15 @@ async function createDeskTicket(channelUrl, userId) {
   }
 
   const deskChannelUrl = ticketRes.data.channelUrl;
+  const ticketId = ticketRes.data.id;
   deskChannels.add(deskChannelUrl);
-  console.log("Desk ticket created! Desk channel:", deskChannelUrl);
+  console.log(`Desk ticket created! ID: ${ticketId}, Desk channel: ${deskChannelUrl}, status: ${ticketRes.data.status}`);
 
   // Persist mapping so agent replies can be routed back to the customer
   try {
     await ChannelMapping.findOneAndUpdate(
       { deskChannelUrl },
-      { deskChannelUrl, originalChannelUrl: channelUrl, userId },
+      { deskChannelUrl, originalChannelUrl: channelUrl, userId, ticketId },
       { upsert: true, new: true }
     );
     console.log("✅ Channel mapping saved to DB");
@@ -448,6 +449,8 @@ async function createDeskTicket(channelUrl, userId) {
   } catch (err) {
     console.error("⚠️ Initial Desk message failed (non-fatal):", err.response?.status, err.message);
   }
+
+  return { ticketId, deskChannelUrl };
 }
 
 // ===============================
@@ -684,9 +687,14 @@ app.post("/escalate", async (req, res) => {
     }
 
     try {
-      await createDeskTicket(channelUrl, userId);
+      const ticket = await createDeskTicket(channelUrl, userId);
       escalatedChannels.add(channelUrl);
-      await sendBotMessage(channelUrl, "Connecting you with a human agent... A support ticket has been created and an agent will join shortly.");
+      const ticketRef = ticket?.ticketId ? ` (Ticket #${ticket.ticketId})` : "";
+      await sendBotMessage(
+        channelUrl,
+        `Support ticket created${ticketRef}. An agent will join shortly.\n\n` +
+        `In your Sendbird Desk dashboard, go to → All Tickets (or New/Unassigned) to find this ticket.`
+      );
     } catch (err) {
       console.error("Desk ticket creation failed:", err.message);
       await sendBotMessage(channelUrl, "We're having trouble connecting you right now. Please try again in a moment or email support directly.");
@@ -697,6 +705,54 @@ app.post("/escalate", async (req, res) => {
   } catch (err) {
     return handleError(res, err, "escalate");
   }
+});
+
+// ----------------------------------------------------------
+// GET /debug-desk?userId=<userId>
+// Diagnostic endpoint: tests Desk API connectivity step-by-step
+// and returns the raw API responses so we can see what the Desk
+// API actually creates and where the ticket ends up.
+// ----------------------------------------------------------
+app.get("/debug-desk", async (req, res) => {
+  const userId = req.query.userId || "debug_user";
+  const baseUrl = `https://desk-api-${SENDBIRD_APP_ID}.sendbird.com/platform/v1`;
+  const headers = { SENDBIRDDESKAPITOKEN: SENDBIRDDESKAPITOKEN, "Content-Type": "application/json" };
+  const result = {};
+
+  // Step 1: Search for customer
+  try {
+    const r = await axios.get(`${baseUrl}/customers?sendbird_id=${userId}`, { headers });
+    result.customerSearch = { status: r.status, data: r.data };
+  } catch (err) {
+    result.customerSearch = { error: err.response?.status, detail: err.response?.data || err.message };
+    return res.json({ step_failed: "customerSearch", result });
+  }
+
+  // Step 2: Create customer if not found
+  let customerId = result.customerSearch.data?.results?.[0]?.id;
+  if (!customerId) {
+    try {
+      const r = await axios.post(`${baseUrl}/customers`, { sendbirdId: userId, displayName: userId }, { headers });
+      customerId = r.data.id;
+      result.customerCreate = { status: r.status, data: r.data };
+    } catch (err) {
+      result.customerCreate = { error: err.response?.status, detail: err.response?.data || err.message };
+      return res.json({ step_failed: "customerCreate", result });
+    }
+  } else {
+    result.customerCreate = { skipped: true, customerId };
+  }
+
+  // Step 3: Create ticket
+  try {
+    const r = await axios.post(`${baseUrl}/tickets`, { channelName: `Debug - ${userId}`, customerId }, { headers });
+    result.ticketCreate = { status: r.status, data: r.data };
+  } catch (err) {
+    result.ticketCreate = { error: err.response?.status, detail: err.response?.data || err.message };
+    return res.json({ step_failed: "ticketCreate", result });
+  }
+
+  return res.json({ all_steps_passed: true, result });
 });
 
 // ----------------------------------------------------------
