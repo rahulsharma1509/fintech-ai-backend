@@ -52,18 +52,24 @@ app.use((req, res, next) => {
 // ===============================
 // RATE LIMITING
 // ===============================
+// Global limiter applies only to non-webhook routes.
+// The webhook is excluded because Sendbird fires events for every message
+// (including bot replies), so heavy testing quickly burns through a low limit.
 const globalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 60,
+  max: 200,
   standardHeaders: true,
   legacyHeaders: false,
+  skip: (req) => req.path === "/sendbird-webhook",
   message: { error: "Too many requests, please try again later." },
 });
 app.use(globalLimiter);
 
+// Webhook gets its own generous limiter — 600 req/min covers bursts from
+// Sendbird retries and simultaneous users without blocking legitimate traffic.
 const webhookLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 120,
+  max: 600,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Webhook rate limit exceeded." },
@@ -826,16 +832,19 @@ app.post("/sendbird-webhook", webhookLimiter, async (req, res) => {
 });
 
 // ----------------------------------------------------------
-// GET / — health check
+// GET / and GET /health — health check (used by uptime monitors to keep the
+// Render service awake; excluded from rate limiting via the skip rule above)
 // ----------------------------------------------------------
-app.get("/", (_req, res) => {
+const healthHandler = (_req, res) => {
   res.json({
     status: "ok",
     service: "fintech-ai-backend",
     redis: redisClient ? "connected" : "in-memory fallback",
     stripe: stripe ? "configured" : "not configured (demo mode)",
   });
-});
+};
+app.get("/", healthHandler);
+app.get("/health", healthHandler);
 
 app.listen(PORT || 8000, () => {
   console.log(`Server running on port ${PORT || 8000}`);
