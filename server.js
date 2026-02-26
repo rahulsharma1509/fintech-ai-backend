@@ -383,7 +383,7 @@ async function createDeskTicket(channelUrl, userId) {
   try {
     ticketRes = await axios.post(
       `${baseUrl}/tickets`,
-      { channelName: `Support - ${userId}`, customerId },
+      { channelName: `Support - ${userId}`, customerId, relatedChannelUrls: [channelUrl] },
       { headers }
     );
     console.log("🎫 Desk ticket creation response:", JSON.stringify(ticketRes.data));
@@ -653,31 +653,52 @@ app.post("/escalate", async (req, res) => {
     await addBotToChannel(channelUrl);
 
     if (escalatedChannels.has(channelUrl)) {
-      // Verify a real Desk channel still exists in the DB for this channel.
-      // If the mapping is stale (previous run failed partway) or the Desk
-      // channel was deleted, clear the flag and fall through to re-create.
+      // Verify a real, ACTIVE Desk ticket still exists for this channel.
+      // If the mapping is stale (ticket INITIALIZED / channel deleted / no DB record),
+      // clear the flag and fall through to re-create.
       const mapping = await ChannelMapping.findOne({ originalChannelUrl: channelUrl });
       if (mapping) {
+        let ticketIsActive = false;
         try {
-          // Confirm the Sendbird channel referenced by the mapping still exists.
-          await axios.get(
-            `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/group_channels/${mapping.deskChannelUrl}`,
-            { headers: { "Api-Token": SENDBIRD_API_TOKEN } }
-          );
-          // Channel exists — ticket is live. Include the Desk channel URL so
-          // the agent can find the unassigned ticket in the Desk dashboard.
+          // Check ticket status via Desk API — INITIALIZED tickets are invisible to agents.
+          if (mapping.ticketId) {
+            const deskBaseUrl = `https://desk-api-${SENDBIRD_APP_ID}.sendbird.com/platform/v1`;
+            const deskHeaders = { SENDBIRDDESKAPITOKEN: SENDBIRDDESKAPITOKEN };
+            const ticketCheck = await axios.get(
+              `${deskBaseUrl}/tickets/${mapping.ticketId}`,
+              { headers: deskHeaders }
+            );
+            const ticketStatus = ticketCheck.data.status2 || ticketCheck.data.status;
+            console.log(`🎫 Existing ticket #${mapping.ticketId} status: ${ticketStatus}`);
+            if (ticketStatus && ticketStatus !== "INITIALIZED") {
+              ticketIsActive = true;
+            } else {
+              console.warn(`⚠️ Ticket #${mapping.ticketId} is ${ticketStatus} (invisible to agents) — will re-escalate.`);
+            }
+          } else {
+            // No ticketId stored — check if the Sendbird channel still exists
+            await axios.get(
+              `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/group_channels/${mapping.deskChannelUrl}`,
+              { headers: { "Api-Token": SENDBIRD_API_TOKEN } }
+            );
+            ticketIsActive = true; // assume live if channel exists and no ticketId to check
+          }
+        } catch {
+          console.warn("⚠️ Could not verify ticket status — re-escalating to be safe.");
+        }
+
+        if (ticketIsActive) {
           await sendBotMessage(
             channelUrl,
-            `Your support ticket is already open (Desk channel: ${mapping.deskChannelUrl}). ` +
-            `An agent will join shortly — if no one has responded, ask your Sendbird Desk admin to check the "New" or "All Tickets" view for unassigned tickets.`
+            `Your support ticket is already open (Ticket #${mapping.ticketId || mapping.deskChannelUrl}). ` +
+            `An agent will join shortly.`
           );
           return res.json({ success: true, message: "Already escalated" });
-        } catch {
-          // Desk channel gone — delete stale mapping and re-escalate.
-          console.warn("⚠️ Stale Desk mapping found — Desk channel no longer exists. Re-escalating.");
-          await ChannelMapping.deleteOne({ originalChannelUrl: channelUrl });
-          escalatedChannels.delete(channelUrl);
         }
+
+        // Ticket is INITIALIZED or unverifiable — delete stale mapping and re-escalate.
+        await ChannelMapping.deleteOne({ originalChannelUrl: channelUrl });
+        escalatedChannels.delete(channelUrl);
       } else {
         // In-memory flag set but no DB record — clear stale flag and re-escalate.
         console.warn("⚠️ escalatedChannels has channel but no DB mapping — clearing stale state.");
