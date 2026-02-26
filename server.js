@@ -401,36 +401,53 @@ async function createDeskTicket(channelUrl, userId) {
   console.log("Desk ticket created! Desk channel:", deskChannelUrl);
 
   // Persist mapping so agent replies can be routed back to the customer
-  await ChannelMapping.findOneAndUpdate(
-    { deskChannelUrl },
-    { deskChannelUrl, originalChannelUrl: channelUrl, userId },
-    { upsert: true, new: true }
-  );
-  console.log("✅ Channel mapping saved to DB");
+  try {
+    await ChannelMapping.findOneAndUpdate(
+      { deskChannelUrl },
+      { deskChannelUrl, originalChannelUrl: channelUrl, userId },
+      { upsert: true, new: true }
+    );
+    console.log("✅ Channel mapping saved to DB");
+  } catch (err) {
+    console.error("⚠️ Channel mapping save failed (non-fatal):", err.message);
+  }
 
-  // Step 3: Add agents + customer to the Desk channel
-  const agentIds = await getOnlineAgents();
+  // Step 3: Add agents + customer to the Desk channel (non-fatal — ticket already created)
+  let agentIds = [];
+  try {
+    agentIds = await getOnlineAgents();
+  } catch (err) {
+    console.error("⚠️ getOnlineAgents failed (non-fatal):", err.response?.status, err.message);
+  }
   const memberIds = [userId, ...agentIds];
   console.log("Adding members to Desk channel:", memberIds);
 
-  await axios.put(
-    `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/group_channels/${deskChannelUrl}/members`,
-    { user_ids: memberIds },
-    { headers: { "Api-Token": SENDBIRD_API_TOKEN, "Content-Type": "application/json" } }
-  );
-  console.log("✅ Members added to Desk channel");
+  try {
+    await axios.put(
+      `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/group_channels/${deskChannelUrl}/members`,
+      { user_ids: memberIds },
+      { headers: { "Api-Token": SENDBIRD_API_TOKEN, "Content-Type": "application/json" } }
+    );
+    console.log("✅ Members added to Desk channel");
+  } catch (err) {
+    console.error("⚠️ Adding members to Desk channel failed (non-fatal):", err.response?.status, err.message);
+  }
 
-  // Step 4: Send initial message to activate the Desk ticket
-  await axios.post(
-    `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/group_channels/${deskChannelUrl}/messages`,
-    {
-      message_type: "MESG",
-      user_id: userId,
-      message: `Hi, I need help with my failed transaction. Ref: ${channelUrl}`,
-    },
-    { headers: { "Api-Token": SENDBIRD_API_TOKEN, "Content-Type": "application/json" } }
-  );
-  console.log(`✅ Initial message sent in Desk channel for user: ${userId}`);
+  // Step 4: Send initial message to activate the Desk ticket (non-fatal)
+  try {
+    await axios.post(
+      `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/group_channels/${deskChannelUrl}/messages`,
+      {
+        message_type: "MESG",
+        user_id: userId,
+        message: `Hi, I need help with my failed transaction. Ref: ${channelUrl}`,
+      },
+      { headers: { "Api-Token": SENDBIRD_API_TOKEN, "Content-Type": "application/json" } }
+    );
+    console.log(`✅ Initial message sent in Desk channel for user: ${userId}`);
+  } catch (err) {
+    console.error("⚠️ Initial Desk message failed (non-fatal):", err.response?.status, err.message);
+  }
 }
 
 // ===============================
