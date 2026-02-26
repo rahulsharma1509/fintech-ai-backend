@@ -413,26 +413,29 @@ async function createDeskTicket(channelUrl, userId) {
     console.error("⚠️ Channel mapping save failed (non-fatal):", err.message);
   }
 
-  // Step 3: Add customer + agents to the Desk channel.
-  // Customer must be added first so the activation message counts as a member message.
-  let agentIds = [];
-  try {
-    agentIds = await getOnlineAgents();
-  } catch (err) {
-    console.error("⚠️ getOnlineAgents failed (non-fatal):", err.response?.status, err.message);
-  }
-  const memberIds = [userId, ...agentIds];
-  console.log("Adding members to Desk channel:", memberIds);
+  // Step 3: Invite customer to the Desk backing channel via the correct /invite endpoint.
+  // This is CRITICAL — the customer must be a channel member before Step 4 can send a message.
+  // (PUT /members is for other operations; POST /invite is the correct add-member endpoint.)
+  await axios.post(
+    `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/group_channels/${deskChannelUrl}/invite`,
+    { user_ids: [userId] },
+    { headers: { "Api-Token": SENDBIRD_API_TOKEN, "Content-Type": "application/json" } }
+  );
+  console.log(`✅ Customer ${userId} invited to Desk channel`);
 
+  // Invite online agents too (non-fatal — Desk manages agent assignment separately)
   try {
-    await axios.put(
-      `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/group_channels/${deskChannelUrl}/members`,
-      { user_ids: memberIds },
-      { headers: { "Api-Token": SENDBIRD_API_TOKEN, "Content-Type": "application/json" } }
-    );
-    console.log("✅ Members added to Desk channel");
+    const agentIds = await getOnlineAgents();
+    if (agentIds.length > 0) {
+      await axios.post(
+        `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/group_channels/${deskChannelUrl}/invite`,
+        { user_ids: agentIds },
+        { headers: { "Api-Token": SENDBIRD_API_TOKEN, "Content-Type": "application/json" } }
+      );
+      console.log(`✅ Agents invited to Desk channel: ${agentIds.join(", ")}`);
+    }
   } catch (err) {
-    console.error("⚠️ Adding members to Desk channel failed (non-fatal):", err.response?.status, err.message);
+    console.error("⚠️ Agent invitation failed (non-fatal):", err.response?.status, err.message);
   }
 
   // Step 4: Send initial message from the customer to activate the ticket.
