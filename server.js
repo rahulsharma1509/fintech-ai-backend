@@ -467,8 +467,9 @@ async function createDeskTicket(channelUrl, userId) {
   //
   // Attempt order (cleanest → most reliable):
   //   A. PATCH /tickets/{id} with status2=UNASSIGNED — direct status update
-  //   B. POST  /tickets/{id}/transfer_to_group      — assign to Default team (id 19612)
-  //   C. PUT   /tickets/{id}/assign then cancel     — assign+cancel round-trip
+  //   B. PUT   /tickets/{id}/assign then cancel     — assign+cancel round-trip
+  //      (assigns to any active agent to activate the ticket, then immediately cancels
+  //       so it lands in UNASSIGNED / All Tickets queue for agents to pick up)
   try {
     const agentsRes = await axios.get(`${baseUrl}/agents?status=ACTIVE&limit=1`, { headers });
     const agents = agentsRes.data.results || [];
@@ -488,22 +489,7 @@ async function createDeskTicket(channelUrl, userId) {
       }
     }
 
-    // Attempt B: group transfer → ticket lands in All Tickets for the Default team
-    if (!unassigned) {
-      try {
-        await axios.post(
-          `${baseUrl}/tickets/${ticketId}/transfer_to_group`,
-          { groupId: 19612 },
-          { headers }
-        );
-        console.log(`✅ Ticket #${ticketId} transferred to Default team — visible in All Tickets`);
-        unassigned = true;
-      } catch (e) {
-        console.warn(`⚠️ transfer_to_group failed: HTTP ${e.response?.status} — ${JSON.stringify(e.response?.data)}`);
-      }
-    }
-
-    // Attempt C: assign to activate, then cancel to release back to UNASSIGNED queue
+    // Attempt B: assign+cancel round-trip to activate ticket then release to UNASSIGNED queue
     if (!unassigned && agent) {
       let assigned = false;
       try {
@@ -982,6 +968,59 @@ app.post("/payment-webhook", async (req, res) => {
 });
 
 // ----------------------------------------------------------
+// POST /desk-webhook
+// Handles Sendbird DESK webhook events (configured separately in the Sendbird
+// Desk portal under Settings → Webhooks → add your server URL + /desk-webhook).
+//
+// The Desk portal fires "ticket:message_create" whenever an agent replies in a
+// ticket — the regular Chat webhook does NOT receive these.  We use this to
+// relay agent messages back to the customer's original channel.
+// ----------------------------------------------------------
+app.post("/desk-webhook", webhookLimiter, async (req, res) => {
+  res.sendStatus(200); // acknowledge immediately
+  try {
+    const event = req.body;
+    console.log("📬 Desk webhook received:", JSON.stringify(event).slice(0, 400));
+
+    // Sendbird Desk fires several categories; we only care about agent messages.
+    // Known categories: ticket:message_create, ticket:created, ticket:assigned,
+    // ticket:closed, ticket:reopened
+    const category = event.category || event.type || "";
+    if (!category.includes("message")) return;
+
+    // Payload shape can vary by Desk SDK version — handle both known shapes.
+    const ticketChannelUrl =
+      event.ticket?.channelUrl ||
+      event.ticket?.channel_url ||
+      event.channel?.channel_url ||
+      event.channelUrl;
+
+    const senderType  = (event.sender?.type  || event.message?.sender?.type  || "").toUpperCase();
+    const messageText =  event.message?.plainText ||
+                         event.message?.message   ||
+                         event.payload?.message   || "";
+
+    console.log(`📬 Desk webhook — category: ${category}, senderType: ${senderType}, channel: ${ticketChannelUrl}, message: "${messageText}"`);
+
+    // Only relay AGENT messages (not customer messages — those are already in the
+    // original channel; relaying them back would create a duplicate).
+    if (senderType !== "AGENT" && senderType !== "BOT") return;
+    if (!messageText || !ticketChannelUrl) return;
+
+    const mapping = await ChannelMapping.findOne({ deskChannelUrl: ticketChannelUrl });
+    if (!mapping) {
+      console.warn(`⚠️ Desk webhook: no mapping for desk channel ${ticketChannelUrl}`);
+      return;
+    }
+
+    await sendBotMessage(mapping.originalChannelUrl, `[Support Agent]: ${messageText}`);
+    console.log(`✅ Agent reply relayed to customer channel ${mapping.originalChannelUrl}`);
+  } catch (err) {
+    console.error("Desk webhook error:", err.message);
+  }
+});
+
+// ----------------------------------------------------------
 // POST /sendbird-webhook
 // Main bot logic — unchanged escalation flow, extended with intent detection,
 // KB fallback, and action button messages for failed transactions.
@@ -1011,10 +1050,17 @@ app.post("/sendbird-webhook", webhookLimiter, async (req, res) => {
     if (senderId === "support_bot") return res.sendStatus(200);
 
     // ── Desk channel: forward agent replies back to the customer ──
+    // NOTE: this path fires only if the Sendbird Chat webhook also covers Desk
+    // backing channels. The dedicated /desk-webhook endpoint is the primary relay.
     if (channelUrl?.startsWith("sendbird_desk_") || deskChannels.has(channelUrl)) {
+      console.log(`📬 Chat webhook fired for Desk channel — sender: ${senderId}, channel: ${channelUrl}`);
       const mapping = await ChannelMapping.findOne({ deskChannelUrl: channelUrl });
-      if (mapping && senderId !== mapping.userId) {
-        console.log(`📨 Forwarding agent message to customer channel: ${mapping.originalChannelUrl}`);
+      if (!mapping) {
+        console.warn(`⚠️ No mapping found for Desk channel ${channelUrl}`);
+      } else if (senderId === mapping.userId) {
+        console.log(`ℹ️ Skipping — message is from the customer themselves (already in their channel)`);
+      } else {
+        console.log(`📨 Relaying agent reply to customer channel: ${mapping.originalChannelUrl}`);
         await sendBotMessage(mapping.originalChannelUrl, `[Support Agent]: ${messageText}`);
       }
       return res.sendStatus(200);
