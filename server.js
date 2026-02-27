@@ -384,7 +384,7 @@ async function createDeskTicket(channelUrl, userId) {
   try {
     ticketRes = await axios.post(
       `${baseUrl}/tickets`,
-      { channelName: `Support - ${userId}`, customerId, relatedChannelUrls: [channelUrl] },
+      { channelName: `Support - ${userId}`, customerId },
       { headers }
     );
     console.log("🎫 Desk ticket creation response:", JSON.stringify(ticketRes.data));
