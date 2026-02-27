@@ -459,55 +459,90 @@ async function createDeskTicket(channelUrl, userId) {
     console.warn(`⚠️ Chat API activation message failed (non-fatal): HTTP ${err.response?.status} — ${JSON.stringify(err.response?.data) || err.message}`);
   }
 
-  // Step 5: Directly assign the ticket to an available agent.
+  // Step 5: Move ticket from INITIALIZED → UNASSIGNED (visible in All Tickets).
+  //
+  // The desired flow: All Tickets (UNASSIGNED) → auto-routing → My Tickets (IN_PROGRESS).
   // Sendbird Desk only auto-activates INITIALIZED tickets when the agent is actively
-  // connected to the Desk portal. Direct assignment via PUT /assign bypasses the
-  // "waiting for customer message" requirement and moves the ticket from INITIALIZED
-  // straight to IN_PROGRESS, making it immediately visible in the agent's ticket list.
-  // NOTE: POST /assign returns 405 — Sendbird Desk requires PUT for this endpoint.
+  // connected, so we must trigger the transition manually via the Platform API.
+  //
+  // Attempt order (cleanest → most reliable):
+  //   A. PATCH /tickets/{id} with status2=UNASSIGNED — direct status update
+  //   B. POST  /tickets/{id}/transfer_to_group      — assign to Default team (id 19612)
+  //   C. PUT   /tickets/{id}/assign then cancel     — assign+cancel round-trip
   try {
-    const agentsRes = await axios.get(
-      `${baseUrl}/agents?status=ACTIVE&limit=10`,
-      { headers }
-    );
+    const agentsRes = await axios.get(`${baseUrl}/agents?status=ACTIVE&limit=1`, { headers });
     const agents = agentsRes.data.results || [];
-    console.log(`👥 Available agents for assignment: ${agents.length}`);
-    if (agents.length > 0) {
-      const agent = agents[0];
-      // Try PUT /assign first, then PATCH on the ticket as fallback
-      let assigned = false;
+    console.log(`👥 Available agents: ${agents.length}`);
+    const agent = agents[0] || null;
+
+    let unassigned = false;
+
+    // Attempt A: direct status update
+    if (!unassigned) {
       try {
-        await axios.put(
-          `${baseUrl}/tickets/${ticketId}/assign`,
-          { agentId: agent.id },
+        await axios.patch(`${baseUrl}/tickets/${ticketId}`, { status2: "UNASSIGNED" }, { headers });
+        console.log(`✅ Ticket #${ticketId} moved to UNASSIGNED via PATCH — visible in All Tickets`);
+        unassigned = true;
+      } catch (e) {
+        console.warn(`⚠️ PATCH status2=UNASSIGNED failed: HTTP ${e.response?.status} — ${JSON.stringify(e.response?.data)}`);
+      }
+    }
+
+    // Attempt B: group transfer → ticket lands in All Tickets for the Default team
+    if (!unassigned) {
+      try {
+        await axios.post(
+          `${baseUrl}/tickets/${ticketId}/transfer_to_group`,
+          { groupId: 19612 },
           { headers }
         );
-        console.log(`✅ Ticket #${ticketId} directly assigned to agent "${agent.displayName}" (id: ${agent.id}) via PUT /assign`);
-        assigned = true;
-      } catch (e1) {
-        console.warn(`⚠️ PUT /assign failed: HTTP ${e1.response?.status} — ${JSON.stringify(e1.response?.data)}`);
+        console.log(`✅ Ticket #${ticketId} transferred to Default team — visible in All Tickets`);
+        unassigned = true;
+      } catch (e) {
+        console.warn(`⚠️ transfer_to_group failed: HTTP ${e.response?.status} — ${JSON.stringify(e.response?.data)}`);
       }
-      if (!assigned) {
-        try {
-          await axios.patch(
-            `${baseUrl}/tickets/${ticketId}`,
-            { agentId: agent.id },
-            { headers }
-          );
-          console.log(`✅ Ticket #${ticketId} assigned via PATCH /tickets/{id}`);
-          assigned = true;
-        } catch (e2) {
-          console.warn(`⚠️ PATCH assignment failed: HTTP ${e2.response?.status} — ${JSON.stringify(e2.response?.data)}`);
+    }
+
+    // Attempt C: assign to activate, then cancel to release back to UNASSIGNED queue
+    if (!unassigned && agent) {
+      let assigned = false;
+      try {
+        await axios.put(`${baseUrl}/tickets/${ticketId}/assign`, { agentId: agent.id }, { headers });
+        console.log(`✅ Ticket #${ticketId} temporarily assigned to agent ${agent.id}`);
+        assigned = true;
+      } catch (e) {
+        console.warn(`⚠️ PUT /assign failed: HTTP ${e.response?.status} — ${JSON.stringify(e.response?.data)}`);
+      }
+
+      if (assigned) {
+        // Cancel assignment → ticket moves to UNASSIGNED (All Tickets)
+        let cancelled = false;
+        for (const [method, url, body] of [
+          ["delete", `${baseUrl}/tickets/${ticketId}/agents/${agent.id}`, null],
+          ["post",   `${baseUrl}/tickets/${ticketId}/cancel_assignment`,  { agentId: agent.id }],
+        ]) {
+          try {
+            await axios({ method, url, data: body, headers });
+            console.log(`✅ Assignment cancelled via ${method.toUpperCase()} — ticket #${ticketId} now UNASSIGNED (All Tickets)`);
+            cancelled = true;
+            unassigned = true;
+            break;
+          } catch (e) {
+            console.warn(`⚠️ Cancel via ${method.toUpperCase()} ${url.split("/").pop()} failed: HTTP ${e.response?.status} — ${JSON.stringify(e.response?.data)}`);
+          }
+        }
+        if (!cancelled) {
+          console.warn(`⚠️ Could not cancel assignment — ticket #${ticketId} stays assigned to agent (visible in My Tickets)`);
+          unassigned = true; // at least it's visible
         }
       }
-      if (!assigned) {
-        console.warn(`⚠️ All assignment methods failed — ticket #${ticketId} is INITIALIZED and waiting in queue`);
-      }
-    } else {
-      console.warn("⚠️ No ACTIVE agents found — ticket left in queue (will appear when agent logs into Desk portal)");
+    }
+
+    if (!unassigned) {
+      console.warn(`⚠️ All activation attempts failed — ticket #${ticketId} is INITIALIZED (only findable by search)`);
     }
   } catch (err) {
-    console.warn(`⚠️ Assignment step failed (non-fatal): ${err.message}`);
+    console.warn(`⚠️ Step 5 failed (non-fatal): ${err.message}`);
   }
 
   return { ticketId, deskChannelUrl };
