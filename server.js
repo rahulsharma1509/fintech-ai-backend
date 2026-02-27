@@ -1055,10 +1055,11 @@ const healthHandler = (_req, res) => {
     stripe: stripe ? "configured" : "not configured (demo mode)",
     stripe_webhook_secret: STRIPE_WEBHOOK_SECRET ? "set" : "MISSING ⚠️ — MongoDB won't update after payment",
     frontend_url: FRONTEND_URL || "MISSING ⚠️ — Stripe redirects to localhost:3000 instead of your app",
-    sendbird_app_id: SENDBIRD_APP_ID ? "set" : "MISSING ⚠️",
+    sendbird_app_id: SENDBIRD_APP_ID || "MISSING ⚠️",
     sendbird_api_token: SENDBIRD_API_TOKEN ? "set" : "MISSING ⚠️",
     sendbird_desk_token: SENDBIRDDESKAPITOKEN ? "set" : "MISSING ⚠️ — desk ticket creation will fail",
     mongodb: mongoose.connection.readyState === 1 ? "connected" : "disconnected",
+    escalated_channels_in_memory: escalatedChannels.size,
   });
 };
 app.get("/", healthHandler);
