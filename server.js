@@ -925,17 +925,13 @@ app.post("/sendbird-webhook", webhookLimiter, async (req, res) => {
     if (senderId === "support_bot") return res.sendStatus(200);
 
     // ── Desk channel: forward agent replies back to the customer ──
-    // NOTE: this path fires only if the Sendbird Chat webhook also covers Desk
-    // backing channels. The dedicated /desk-webhook endpoint is the primary relay.
+    // When an agent replies in the Desk portal, Sendbird fires the Chat webhook
+    // for that message. We detect it's a Desk backing channel, look up the original
+    // customer channel from the mapping, and relay the message via the bot.
     if (channelUrl?.startsWith("sendbird_desk_") || deskChannels.has(channelUrl)) {
-      console.log(`📬 Chat webhook fired for Desk channel — sender: ${senderId}, channel: ${channelUrl}`);
       const mapping = await ChannelMapping.findOne({ deskChannelUrl: channelUrl });
-      if (!mapping) {
-        console.warn(`⚠️ No mapping found for Desk channel ${channelUrl}`);
-      } else if (senderId === mapping.userId) {
-        console.log(`ℹ️ Skipping — message is from the customer themselves (already in their channel)`);
-      } else {
-        console.log(`📨 Relaying agent reply to customer channel: ${mapping.originalChannelUrl}`);
+      if (mapping && senderId !== mapping.userId) {
+        console.log(`📨 Forwarding agent message to customer channel: ${mapping.originalChannelUrl}`);
         await sendBotMessage(mapping.originalChannelUrl, `[Support Agent]: ${messageText}`);
       }
       return res.sendStatus(200);
