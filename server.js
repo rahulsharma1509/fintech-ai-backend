@@ -487,6 +487,35 @@ async function createDeskTicket(channelUrl, userId) {
     console.warn("⚠️ Post-activation status check failed (non-fatal):", err.message);
   }
 
+  // Step 5: Directly assign the ticket to an online agent.
+  // Sendbird Desk only auto-activates INITIALIZED tickets when the agent is
+  // actively connected to the Desk portal. Bypassing the UNASSIGNED queue with
+  // a direct assignment guarantees the ticket is visible (IN_PROGRESS) to the
+  // assigned agent regardless of connection state.
+  try {
+    const agentsRes = await axios.get(
+      `${baseUrl}/agents?status=ACTIVE&limit=10`,
+      { headers }
+    );
+    const agents = agentsRes.data.results || [];
+    console.log(`👥 Available agents for assignment: ${agents.length}`);
+    if (agents.length > 0) {
+      const agent = agents[0];
+      await axios.post(
+        `${baseUrl}/tickets/${ticketId}/assign`,
+        { agentId: agent.id },
+        { headers }
+      );
+      console.log(`✅ Ticket #${ticketId} directly assigned to agent "${agent.displayName}" (id: ${agent.id})`);
+    } else {
+      console.warn("⚠️ No ACTIVE agents found — ticket left in queue (will appear when agent logs into Desk portal)");
+    }
+  } catch (err) {
+    console.warn(
+      `⚠️ Direct assignment failed (non-fatal): HTTP ${err.response?.status} — ${JSON.stringify(err.response?.data) || err.message}`
+    );
+  }
+
   return { ticketId, deskChannelUrl };
 }
 
