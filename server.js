@@ -436,62 +436,31 @@ async function createDeskTicket(channelUrl, userId) {
     console.warn(`⚠️ Adding members to Desk channel failed (non-fatal): HTTP ${err.response?.status} — ${JSON.stringify(err.response?.data) || err.message}`);
   }
 
-  // Step 4: Activate the ticket so it transitions INITIALIZED → UNASSIGNED
-  // and becomes visible to agents in the Desk dashboard.
-  //
-  // Primary: Desk Platform API ticket-message endpoint — this goes through Desk's
-  // own state machine and is the most reliable way to trigger the transition.
-  // Fallback: Chat Platform API — used if the Desk endpoint is unavailable.
-  let deskActivated = false;
+  // Step 4: Send activation message via Chat Platform API.
+  // NOTE: Desk Platform API /tickets/{id}/messages returns 404 (endpoint does not exist).
+  // The Chat API message IS delivered to the Desk backing channel but does NOT
+  // trigger INITIALIZED → UNASSIGNED on its own — direct assignment in Step 5 does.
   try {
     await axios.post(
-      `${baseUrl}/tickets/${ticketId}/messages`,
-      { type: "MESG", message: "Hi, I need help with my account.", customerId },
-      { headers }
+      `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/group_channels/${deskChannelUrl}/messages`,
+      {
+        message_type: "MESG",
+        user_id: userId,
+        message: `Hi, I need help with my failed payment. Original channel: ${channelUrl}`,
+      },
+      { headers: { "Api-Token": SENDBIRD_API_TOKEN, "Content-Type": "application/json" } }
     );
-    console.log(`✅ Activation message sent via Desk Platform API — ticket should be UNASSIGNED`);
-    deskActivated = true;
+    console.log(`✅ Activation message sent via Chat Platform API`);
   } catch (err) {
-    console.warn(
-      `⚠️ Desk API activation failed (HTTP ${err.response?.status}): ${JSON.stringify(err.response?.data) || err.message} — falling back to Chat API`
-    );
+    console.warn(`⚠️ Chat API activation message failed (non-fatal): HTTP ${err.response?.status} — ${JSON.stringify(err.response?.data) || err.message}`);
   }
 
-  if (!deskActivated) {
-    try {
-      await axios.post(
-        `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/group_channels/${deskChannelUrl}/messages`,
-        {
-          message_type: "MESG",
-          user_id: userId,
-          message: `Hi, I need help with my failed payment. Original channel: ${channelUrl}`,
-        },
-        { headers: { "Api-Token": SENDBIRD_API_TOKEN, "Content-Type": "application/json" } }
-      );
-      console.log(`✅ Activation message sent via Chat Platform API`);
-    } catch (err) {
-      console.error(`❌ Chat API activation also failed: HTTP ${err.response?.status} — ${JSON.stringify(err.response?.data) || err.message}`);
-      throw err;
-    }
-  }
-
-  // Verify the ticket actually transitioned out of INITIALIZED
-  try {
-    const statusCheck = await axios.get(`${baseUrl}/tickets/${ticketId}`, { headers });
-    const ticketStatus = statusCheck.data.status2 || statusCheck.data.status;
-    console.log(`🎫 Post-activation ticket status: ${ticketStatus}`);
-    if (ticketStatus === "INITIALIZED") {
-      console.warn("⚠️ Ticket is still INITIALIZED after activation — may not be visible to agents in the dashboard");
-    }
-  } catch (err) {
-    console.warn("⚠️ Post-activation status check failed (non-fatal):", err.message);
-  }
-
-  // Step 5: Directly assign the ticket to an online agent.
-  // Sendbird Desk only auto-activates INITIALIZED tickets when the agent is
-  // actively connected to the Desk portal. Bypassing the UNASSIGNED queue with
-  // a direct assignment guarantees the ticket is visible (IN_PROGRESS) to the
-  // assigned agent regardless of connection state.
+  // Step 5: Directly assign the ticket to an available agent.
+  // Sendbird Desk only auto-activates INITIALIZED tickets when the agent is actively
+  // connected to the Desk portal. Direct assignment via PUT /assign bypasses the
+  // "waiting for customer message" requirement and moves the ticket from INITIALIZED
+  // straight to IN_PROGRESS, making it immediately visible in the agent's ticket list.
+  // NOTE: POST /assign returns 405 — Sendbird Desk requires PUT for this endpoint.
   try {
     const agentsRes = await axios.get(
       `${baseUrl}/agents?status=ACTIVE&limit=10`,
@@ -501,19 +470,40 @@ async function createDeskTicket(channelUrl, userId) {
     console.log(`👥 Available agents for assignment: ${agents.length}`);
     if (agents.length > 0) {
       const agent = agents[0];
-      await axios.post(
-        `${baseUrl}/tickets/${ticketId}/assign`,
-        { agentId: agent.id },
-        { headers }
-      );
-      console.log(`✅ Ticket #${ticketId} directly assigned to agent "${agent.displayName}" (id: ${agent.id})`);
+      // Try PUT /assign first, then PATCH on the ticket as fallback
+      let assigned = false;
+      try {
+        await axios.put(
+          `${baseUrl}/tickets/${ticketId}/assign`,
+          { agentId: agent.id },
+          { headers }
+        );
+        console.log(`✅ Ticket #${ticketId} directly assigned to agent "${agent.displayName}" (id: ${agent.id}) via PUT /assign`);
+        assigned = true;
+      } catch (e1) {
+        console.warn(`⚠️ PUT /assign failed: HTTP ${e1.response?.status} — ${JSON.stringify(e1.response?.data)}`);
+      }
+      if (!assigned) {
+        try {
+          await axios.patch(
+            `${baseUrl}/tickets/${ticketId}`,
+            { agentId: agent.id },
+            { headers }
+          );
+          console.log(`✅ Ticket #${ticketId} assigned via PATCH /tickets/{id}`);
+          assigned = true;
+        } catch (e2) {
+          console.warn(`⚠️ PATCH assignment failed: HTTP ${e2.response?.status} — ${JSON.stringify(e2.response?.data)}`);
+        }
+      }
+      if (!assigned) {
+        console.warn(`⚠️ All assignment methods failed — ticket #${ticketId} is INITIALIZED and waiting in queue`);
+      }
     } else {
       console.warn("⚠️ No ACTIVE agents found — ticket left in queue (will appear when agent logs into Desk portal)");
     }
   } catch (err) {
-    console.warn(
-      `⚠️ Direct assignment failed (non-fatal): HTTP ${err.response?.status} — ${JSON.stringify(err.response?.data) || err.message}`
-    );
+    console.warn(`⚠️ Assignment step failed (non-fatal): ${err.message}`);
   }
 
   return { ticketId, deskChannelUrl };
