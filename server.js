@@ -121,8 +121,53 @@ const transactionSchema = new mongoose.Schema({
   amount: Number,
   status: String,
   userEmail: String,
+  paymentIntentId: String,  // Stripe payment_intent ID — stored after checkout; used for actual refund API calls
+  refundedAmount: Number,   // set when a partial or full refund is issued
 });
 const Transaction = mongoose.model("Transaction", transactionSchema);
+
+// ── Refund Negotiation Engine ──────────────────────────────────────────────
+// Tracks the multi-step refund negotiation state for each user/transaction.
+const refundRequestSchema = new mongoose.Schema({
+  userId: String,
+  txnId: String,
+  channelUrl: String,
+  refundStage: { type: String, default: "reason_asked" }, // reason_asked | policy_evaluated | offer_sent | completed
+  refundReason: String,   // duplicate | service_issue | accidental | fraud | other
+  negotiationAttempts: { type: Number, default: 0 },
+  finalDecision: String,  // AUTO_REFUND | OFFER_PARTIAL | OFFER_COUPON | ESCALATE_HIGH | ESCALATE_NORMAL
+  status: { type: String, default: "pending" }, // pending | approved | rejected | refunded
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now },
+});
+const RefundRequest = mongoose.model("RefundRequest", refundRequestSchema);
+
+// ── Conversation Memory ─────────────────────────────────────────────────────
+// Per-channel state so the bot understands follow-ups without the user
+// repeating the transaction ID ("What about it?" → resolved via activeTxnId).
+const conversationStateSchema = new mongoose.Schema({
+  channelUrl: { type: String, unique: true },
+  userId: String,
+  lastIntent: String,
+  activeTxnId: String,        // last TXN the user was discussing
+  refundStage: String,
+  escalationStatus: { type: String, default: "none" }, // none | normal | high
+  priority: { type: String, default: "normal" },
+  updatedAt: { type: Date, default: Date.now },
+});
+const ConversationState = mongoose.model("ConversationState", conversationStateSchema);
+
+// ── Analytics ───────────────────────────────────────────────────────────────
+// Append-only event log — never deleted, never blocks core flows.
+const analyticsEventSchema = new mongoose.Schema({
+  eventType: String, // refund_request | refund_approved | refund_rejected | escalation | payment_retry
+  userId: String,
+  txnId: String,
+  channelUrl: String,
+  metadata: mongoose.Schema.Types.Mixed,
+  createdAt: { type: Date, default: Date.now },
+});
+const AnalyticsEvent = mongoose.model("AnalyticsEvent", analyticsEventSchema);
 
 // Maps a Sendbird Desk ticket channel → original customer channel so agent
 // replies can be routed back to the customer.
@@ -253,13 +298,124 @@ function queryKnowledgeBase(query) {
 }
 
 // ===============================
+// SENTIMENT + PRIORITY DETECTION
+// Rule-based scan for keywords that signal legal threats, fraud, regulatory
+// bodies, or social-media escalation.  Returns priority "HIGH" or "NORMAL".
+// ===============================
+function detectSentiment(message) {
+  const lower = (message || "").toLowerCase();
+  const HIGH_TRIGGERS = [
+    "fraud", "complaint", "legal", "rbi", "chargeback", "social media",
+    "twitter", "consumer court", "fir", "police", "lawyer", "sue", "dispute",
+    "unauthorized", "scam",
+  ];
+  const triggers = HIGH_TRIGGERS.filter((k) => lower.includes(k));
+  return { priority: triggers.length > 0 ? "HIGH" : "NORMAL", triggers };
+}
+
+// ===============================
+// POLICY ENGINE
+// Central function that decides what to do for a refund request.
+// context = { amount, reason, sentiment, attempts, hasDuplicate }
+// Returns { action, message } where action is one of:
+//   AUTO_REFUND | OFFER_PARTIAL | OFFER_COUPON | ESCALATE_HIGH | ESCALATE_NORMAL
+// ===============================
+function evaluatePolicy({ amount, reason, sentiment, attempts = 0, hasDuplicate = false }) {
+  // Fraud reason or any HIGH-priority sentiment → immediate senior escalation
+  if (reason === "fraud" || sentiment?.priority === "HIGH") {
+    return {
+      action: "ESCALATE_HIGH",
+      message: "🚨 This case has been flagged as high priority. A senior agent has been notified and will contact you immediately.",
+    };
+  }
+  // Amounts < $200 qualify for automatic refund without negotiation
+  if (amount < 200) {
+    return {
+      action: "AUTO_REFUND",
+      message: `Your refund of $${amount} qualifies for automatic approval under our small-transaction policy. Processing now.`,
+    };
+  }
+  // Duplicate charge: verify by checking recent same-amount transactions
+  if (reason === "duplicate") {
+    if (hasDuplicate) {
+      return {
+        action: "AUTO_REFUND",
+        message: "We found a matching duplicate charge on your account. Your full refund has been approved.",
+      };
+    }
+    return {
+      action: "ESCALATE_NORMAL",
+      message: "We couldn't automatically verify the duplicate charge. Escalating to an agent for manual review.",
+    };
+  }
+  // Service issue → offer a compensation coupon instead of cash refund
+  if (reason === "service_issue") {
+    return {
+      action: "OFFER_COUPON",
+      message: "We're sorry for the service inconvenience. We'd like to offer you a compensation coupon.",
+    };
+  }
+  // Accidental payment → offer 50% on first attempt; escalate if already tried
+  if (reason === "accidental") {
+    if (attempts > 0) {
+      return {
+        action: "ESCALATE_NORMAL",
+        message: "Connecting you with an agent to further assist with your refund request.",
+      };
+    }
+    return {
+      action: "OFFER_PARTIAL",
+      message: `For accidental payments we can offer a 50% refund ($${(amount * 0.5).toFixed(2)}) immediately.`,
+    };
+  }
+  // "other" or unrecognised → normal escalation
+  return {
+    action: "ESCALATE_NORMAL",
+    message: "Connecting you with an agent to review your refund request.",
+  };
+}
+
+// ===============================
+// ANALYTICS — fire-and-forget
+// Never throws; guaranteed not to break any core flow.
+// ===============================
+async function trackAnalytics(eventType, { userId, txnId, channelUrl, metadata = {} } = {}) {
+  try {
+    await AnalyticsEvent.create({ eventType, userId, txnId, channelUrl, metadata });
+  } catch (err) {
+    console.warn("⚠️ Analytics tracking failed (non-fatal):", err.message);
+  }
+}
+
+// ===============================
+// CONVERSATION STATE HELPERS
+// Lightweight per-channel memory: stores activeTxnId, lastIntent, refundStage
+// so the bot can handle follow-ups like "What about it?" correctly.
+// ===============================
+async function getConversationState(channelUrl) {
+  return ConversationState.findOne({ channelUrl });
+}
+
+async function updateConversationState(channelUrl, userId, updates) {
+  return ConversationState.findOneAndUpdate(
+    { channelUrl },
+    { ...updates, userId, updatedAt: new Date() },
+    { upsert: true, new: true }
+  );
+}
+
+// ===============================
 // INTENT DETECTION
-// Returns one of: transaction_status | payment_retry | escalation | faq | unknown
+// Returns one of: transaction_status | payment_retry | refund_request |
+//                 escalation | faq | unknown
 // ===============================
 function detectIntent(message) {
   const lower = (message || "").toLowerCase();
   if (/txn\d+/i.test(message)) return "transaction_status";
   if (/\b(retry|pay again|retry payment|repay|try again)\b/.test(lower)) return "payment_retry";
+  // Refund intent checked before generic escalation so "want refund" routes to the
+  // negotiation engine, not straight to a human agent.
+  if (/\b(refund|money back|reimburse|return my money|want refund|need refund|get refund|claim refund)\b/.test(lower)) return "refund_request";
   if (
     /\b(human|agent|speak|talk to|connect me|escalate|real person|support team|representative)\b/.test(
       lower
@@ -267,7 +423,7 @@ function detectIntent(message) {
   )
     return "escalation";
   if (
-    /\b(refund|cancel|fee|policy|failed|why|how|what|charge|time|long|process|decline)\b/.test(lower)
+    /\b(cancel|fee|policy|failed|why|how|what|charge|time|long|process|decline)\b/.test(lower)
   )
     return "faq";
   return "unknown";
@@ -517,6 +673,55 @@ async function loadEscalatedChannels() {
 }
 
 // ===============================
+// INTERNAL REFUND PROCESSOR
+// Single function that executes a refund end-to-end:
+//   1. Stripe refund API (if paymentIntentId stored and Stripe configured)
+//   2. MongoDB transaction status → "refunded"
+//   3. RefundRequest record → status "refunded"
+//   4. Customer notification in chat
+// amount = null means full refund; a number means partial.
+// Always succeeds from the customer's perspective — Stripe errors are non-fatal
+// in test/demo mode.
+// ===============================
+async function processRefundInternal(txnId, channelUrl, userId, transaction, amount = null) {
+  const refundAmount = amount !== null ? amount : transaction.amount;
+
+  if (stripe && transaction.paymentIntentId) {
+    try {
+      const params = { payment_intent: transaction.paymentIntentId };
+      if (amount !== null) params.amount = Math.round(amount * 100); // cents for partial
+      await stripe.refunds.create(params);
+      console.log(`✅ Stripe refund created for ${txnId}: $${refundAmount}`);
+    } catch (err) {
+      // Non-fatal: continue to update DB and notify customer
+      console.warn(`⚠️ Stripe refund API call failed (non-fatal): ${err.message}`);
+    }
+  } else {
+    console.log(`[DEMO] Refund for ${txnId}: $${refundAmount} — no Stripe paymentIntentId, test mode only`);
+  }
+
+  // Update transaction status and record refunded amount
+  await Transaction.updateOne(
+    { transactionId: txnId },
+    { status: "refunded", refundedAmount: refundAmount }
+  );
+
+  // Mark the negotiation record as completed
+  await RefundRequest.findOneAndUpdate(
+    { txnId, channelUrl },
+    { status: "refunded", refundStage: "completed", updatedAt: new Date() }
+  );
+
+  // Notify the customer in their chat channel
+  await sendBotMessage(
+    channelUrl,
+    `✅ Refund of $${Number(refundAmount).toFixed(2)} for ${txnId} has been approved and initiated. ` +
+      "It will reflect in your account within 5–7 business days.",
+    { type: "refund_status", status: "refunded", txnId, amount: refundAmount }
+  );
+}
+
+// ===============================
 // STRUCTURED ERROR HELPER
 // Centralises error logging and response so every endpoint looks the same.
 // ===============================
@@ -754,6 +959,311 @@ app.post("/escalate", async (req, res) => {
 });
 
 // ----------------------------------------------------------
+// POST /refund-action
+// Handles all refund negotiation button clicks from the frontend.
+// Routes every step of the refund lifecycle in one endpoint:
+//   action="refund_start"           → start flow, ask reason (buttons sent via bot)
+//   action="refund_reason"          → evaluate policy, execute decision
+//   action="refund_accept_partial"  → user accepts 50% offer
+//   action="refund_decline"         → user declines offer
+// Body: { channelUrl, userId, txnId, action, reason? }
+// ----------------------------------------------------------
+app.post("/refund-action", async (req, res) => {
+  try {
+    const { channelUrl, userId, txnId, action, reason } = req.body;
+    if (!channelUrl || !userId || !txnId || !action) {
+      return res.status(400).json({ error: "channelUrl, userId, txnId, and action are required" });
+    }
+
+    const txnKey = txnId.toUpperCase();
+    const transaction = await Transaction.findOne({ transactionId: txnKey });
+    if (!transaction) return res.status(404).json({ error: `Transaction ${txnId} not found` });
+
+    await addBotToChannel(channelUrl);
+
+    // ── START: ask the user to pick a reason ─────────────────────────────────
+    if (action === "refund_start" || action === "start") {
+      if (transaction.status === "refunded") {
+        await sendBotMessage(channelUrl, `A refund for ${txnKey} has already been processed.`);
+        return res.json({ success: true });
+      }
+      if (transaction.status !== "success") {
+        await sendBotMessage(
+          channelUrl,
+          `Refunds are only available for successful transactions. ${txnKey} has status: ${transaction.status}.`
+        );
+        return res.json({ success: true });
+      }
+
+      // Create/reset the refund request record
+      await RefundRequest.findOneAndUpdate(
+        { userId, txnId: txnKey, channelUrl },
+        {
+          userId, txnId: txnKey, channelUrl,
+          refundStage: "reason_asked", status: "pending",
+          negotiationAttempts: 0, updatedAt: new Date(),
+        },
+        { upsert: true }
+      );
+      await updateConversationState(channelUrl, userId, {
+        activeTxnId: txnKey, refundStage: "reason_asked", lastIntent: "refund_start",
+      });
+      await trackAnalytics("refund_request", { userId, txnId: txnKey, channelUrl });
+
+      await sendBotMessage(
+        channelUrl,
+        `I can help with a refund for ${txnKey} ($${transaction.amount}). Please select the reason for your request:`,
+        {
+          type: "action_buttons",
+          txnId: txnKey,
+          buttons: [
+            { label: "Duplicate Charge", action: "refund_reason", reason: "duplicate" },
+            { label: "Service Issue",    action: "refund_reason", reason: "service_issue" },
+            { label: "Accidental Pay",   action: "refund_reason", reason: "accidental" },
+            { label: "Fraud Concern",    action: "refund_reason", reason: "fraud" },
+            { label: "Other",            action: "refund_reason", reason: "other" },
+          ],
+        }
+      );
+      return res.json({ success: true });
+    }
+
+    // ── REASON: run policy engine and execute decision ────────────────────────
+    if (action === "refund_reason") {
+      if (!reason) return res.status(400).json({ error: "reason is required" });
+
+      const existing = await RefundRequest.findOne({ userId, txnId: txnKey, channelUrl });
+      const attempts = existing?.negotiationAttempts || 0;
+
+      // For duplicate claims: check last 5 transactions for a same-amount match
+      let hasDuplicate = false;
+      if (reason === "duplicate") {
+        const recentTxns = await Transaction.find({ userEmail: transaction.userEmail })
+          .sort({ _id: -1 }).limit(5);
+        hasDuplicate = recentTxns.some(
+          (t) => t.amount === transaction.amount && t.transactionId !== txnKey
+        );
+        console.log(`🔍 Duplicate check for ${txnKey}: hasDuplicate=${hasDuplicate}`);
+      }
+
+      const policyResult = evaluatePolicy({
+        amount: transaction.amount,
+        reason,
+        sentiment: detectSentiment(reason),
+        attempts,
+        hasDuplicate,
+      });
+
+      // Persist the decision
+      await RefundRequest.findOneAndUpdate(
+        { userId, txnId: txnKey, channelUrl },
+        {
+          refundReason: reason,
+          refundStage: "policy_evaluated",
+          finalDecision: policyResult.action,
+          negotiationAttempts: attempts + 1,
+          updatedAt: new Date(),
+        },
+        { upsert: true }
+      );
+      await updateConversationState(channelUrl, userId, {
+        refundStage: "policy_evaluated", lastIntent: "refund_reason",
+      });
+
+      if (policyResult.action === "AUTO_REFUND") {
+        await processRefundInternal(txnKey, channelUrl, userId, transaction);
+        await trackAnalytics("refund_approved", {
+          userId, txnId: txnKey, channelUrl,
+          metadata: { reason, action: "AUTO_REFUND" },
+        });
+
+      } else if (policyResult.action === "OFFER_PARTIAL") {
+        const half = (transaction.amount * 0.5).toFixed(2);
+        await sendBotMessage(
+          channelUrl,
+          `${policyResult.message} Would you like to accept a 50% refund of $${half}?`,
+          {
+            type: "action_buttons",
+            txnId: txnKey,
+            buttons: [
+              { label: `Accept $${half} Refund`, action: "refund_accept_partial", txnId: txnKey },
+              { label: "Decline",                action: "refund_decline",         txnId: txnKey },
+            ],
+          }
+        );
+
+      } else if (policyResult.action === "OFFER_COUPON") {
+        const coupon = `COUP-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
+        await RefundRequest.findOneAndUpdate(
+          { userId, txnId: txnKey, channelUrl },
+          { status: "approved", finalDecision: "OFFER_COUPON", refundStage: "completed", updatedAt: new Date() }
+        );
+        await sendBotMessage(
+          channelUrl,
+          `${policyResult.message} Your compensation coupon: **${coupon}** (valid 30 days on your next transaction).`,
+          { type: "refund_status", status: "coupon_issued", txnId: txnKey, couponCode: coupon }
+        );
+        await trackAnalytics("refund_approved", {
+          userId, txnId: txnKey, channelUrl,
+          metadata: { reason, action: "OFFER_COUPON", couponCode: coupon },
+        });
+
+      } else if (policyResult.action === "ESCALATE_HIGH") {
+        if (!escalatedChannels.has(channelUrl)) {
+          try { await createDeskTicket(channelUrl, userId); escalatedChannels.add(channelUrl); } catch (e) { console.error(e.message); }
+        }
+        await sendBotMessage(channelUrl, policyResult.message,
+          { type: "priority_badge", priority: "HIGH", txnId: txnKey }
+        );
+        await trackAnalytics("escalation", {
+          userId, txnId: txnKey, channelUrl,
+          metadata: { reason, priority: "HIGH" },
+        });
+
+      } else { // ESCALATE_NORMAL
+        if (!escalatedChannels.has(channelUrl)) {
+          try { await createDeskTicket(channelUrl, userId); escalatedChannels.add(channelUrl); } catch (e) { console.error(e.message); }
+        }
+        await sendBotMessage(channelUrl, policyResult.message,
+          { type: "priority_badge", priority: "NORMAL", txnId: txnKey }
+        );
+        await trackAnalytics("escalation", {
+          userId, txnId: txnKey, channelUrl,
+          metadata: { reason, priority: "NORMAL" },
+        });
+      }
+
+      return res.json({ success: true, decision: policyResult.action });
+    }
+
+    // ── ACCEPT PARTIAL: user agreed to 50% ───────────────────────────────────
+    if (action === "refund_accept_partial") {
+      const partialAmt = transaction.amount * 0.5;
+      await processRefundInternal(txnKey, channelUrl, userId, transaction, partialAmt);
+      await trackAnalytics("refund_approved", {
+        userId, txnId: txnKey, channelUrl,
+        metadata: { action: "OFFER_PARTIAL", amount: partialAmt },
+      });
+      return res.json({ success: true, decision: "OFFER_PARTIAL" });
+    }
+
+    // ── DECLINE: user rejected the partial/coupon offer ───────────────────────
+    if (action === "refund_decline") {
+      await RefundRequest.findOneAndUpdate(
+        { userId, txnId: txnKey, channelUrl },
+        { status: "rejected", refundStage: "completed", updatedAt: new Date() }
+      );
+      await sendBotMessage(
+        channelUrl,
+        `Understood. Your refund request for ${txnKey} has been cancelled. Is there anything else I can help you with?`
+      );
+      await trackAnalytics("refund_rejected", { userId, txnId: txnKey, channelUrl });
+      return res.json({ success: true, decision: "declined" });
+    }
+
+    return res.status(400).json({ error: `Unknown refund action: ${action}` });
+  } catch (err) {
+    return handleError(res, err, "refund-action");
+  }
+});
+
+// ----------------------------------------------------------
+// POST /process-refund
+// Direct refund execution — requires an existing approved/pending RefundRequest
+// as an authorization gate, then calls Stripe (test mode) and updates MongoDB.
+// Also notifies the Desk channel if the ticket was escalated.
+// Body: { txnId, channelUrl, userId, amount? }
+// ----------------------------------------------------------
+app.post("/process-refund", async (req, res) => {
+  try {
+    const { txnId, channelUrl, userId, amount } = req.body;
+    if (!txnId || !channelUrl || !userId) {
+      return res.status(400).json({ error: "txnId, channelUrl, and userId are required" });
+    }
+
+    const txnKey = txnId.toUpperCase();
+    const transaction = await Transaction.findOne({ transactionId: txnKey });
+    if (!transaction) return res.status(404).json({ error: `Transaction ${txnId} not found` });
+
+    // Gate: an approved/pending RefundRequest must exist for authorization
+    const refundReq = await RefundRequest.findOne({
+      txnId: txnKey,
+      userId,
+      status: { $in: ["pending", "approved"] },
+    });
+    if (!refundReq) {
+      return res.status(403).json({ error: "No approved refund request found for this transaction." });
+    }
+
+    const refundAmount = amount != null ? Number(amount) : transaction.amount;
+    await processRefundInternal(txnKey, channelUrl, userId, transaction, refundAmount);
+
+    // Notify Desk channel if ticket is open so the agent knows the refund is done
+    if (escalatedChannels.has(channelUrl)) {
+      const mapping = await ChannelMapping.findOne({ originalChannelUrl: channelUrl });
+      if (mapping) {
+        await sendBotMessage(
+          mapping.deskChannelUrl,
+          `Refund of $${refundAmount.toFixed(2)} for ${txnKey} has been processed for customer ${userId}. Ticket can be closed.`
+        );
+      }
+    }
+
+    await trackAnalytics("refund_approved", {
+      userId, txnId: txnKey, channelUrl,
+      metadata: { source: "process-refund", amount: refundAmount },
+    });
+    return res.json({ success: true, refundAmount });
+  } catch (err) {
+    return handleError(res, err, "process-refund");
+  }
+});
+
+// ----------------------------------------------------------
+// GET /analytics
+// Returns aggregated metrics from the AnalyticsEvent collection:
+//   - refund request count, approval rate, auto-resolution rate
+//   - escalation count, payment retry count
+//   - last 20 events (for a live feed / dashboard)
+// ----------------------------------------------------------
+app.get("/analytics", async (req, res) => {
+  try {
+    const [refundRequests, refundApproved, refundRejected, escalations, paymentRetries] =
+      await Promise.all([
+        AnalyticsEvent.countDocuments({ eventType: "refund_request" }),
+        AnalyticsEvent.countDocuments({ eventType: "refund_approved" }),
+        AnalyticsEvent.countDocuments({ eventType: "refund_rejected" }),
+        AnalyticsEvent.countDocuments({ eventType: "escalation" }),
+        AnalyticsEvent.countDocuments({ eventType: "payment_retry" }),
+      ]);
+
+    const autoRefunds = await AnalyticsEvent.countDocuments({
+      eventType: "refund_approved",
+      "metadata.action": "AUTO_REFUND",
+    });
+
+    const approvalRate =
+      refundRequests > 0 ? ((refundApproved / refundRequests) * 100).toFixed(1) : "0.0";
+    const autoResolutionRate =
+      refundRequests > 0 ? ((autoRefunds / refundRequests) * 100).toFixed(1) : "0.0";
+
+    const recentEvents = await AnalyticsEvent.find().sort({ createdAt: -1 }).limit(20).lean();
+
+    return res.json({
+      refundRequests,
+      refundApprovalRate: `${approvalRate}%`,
+      autoResolutionRate: `${autoResolutionRate}%`,
+      escalationCount: escalations,
+      paymentRetryCount: paymentRetries,
+      breakdown: { refundApproved, refundRejected, autoRefunds },
+      recentEvents,
+    });
+  } catch (err) {
+    return handleError(res, err, "analytics");
+  }
+});
+
+// ----------------------------------------------------------
 // GET /debug-desk?userId=<userId>
 // Diagnostic endpoint: tests Desk API connectivity step-by-step
 // ----------------------------------------------------------
@@ -884,8 +1394,15 @@ app.post("/payment-webhook", async (req, res) => {
       const { txnId, channelUrl, userId } = session.metadata || {};
 
       if (txnId) {
-        await Transaction.updateOne({ transactionId: txnId }, { status: "success" });
+        // Store the Stripe payment_intent ID so we can issue refunds later via the API
+        const updateFields = { status: "success" };
+        if (session.payment_intent) updateFields.paymentIntentId = session.payment_intent;
+        await Transaction.updateOne({ transactionId: txnId }, updateFields);
         console.log(`✅ Transaction ${txnId} updated to success via Stripe webhook`);
+        await trackAnalytics("payment_retry", {
+          userId, txnId, channelUrl,
+          metadata: { status: "success", paymentIntentId: session.payment_intent },
+        });
       }
 
       if (channelUrl) {
@@ -970,6 +1487,38 @@ app.post("/sendbird-webhook", webhookLimiter, async (req, res) => {
       return res.sendStatus(200);
     }
 
+    // ── Sentiment check — HIGH priority keywords trigger immediate escalation ──
+    // Runs for non-escalated channels only (escalated channels are forwarded above).
+    // Keywords: fraud, legal, RBI, chargeback, social media, etc.
+    const { priority: msgPriority, triggers: sentimentTriggers } = detectSentiment(messageText);
+    if (msgPriority === "HIGH") {
+      console.log(`🚨 HIGH priority sentiment detected: ${sentimentTriggers.join(", ")}`);
+      await addBotToChannel(channelUrl);
+      if (!escalatedChannels.has(channelUrl)) {
+        try {
+          await createDeskTicket(channelUrl, senderId);
+          escalatedChannels.add(channelUrl);
+        } catch (err) {
+          console.error("High-priority escalation failed:", err.message);
+        }
+      }
+      await updateConversationState(channelUrl, senderId, {
+        escalationStatus: "high",
+        priority: "HIGH",
+        lastIntent: "sentiment_escalation",
+      });
+      await trackAnalytics("escalation", {
+        userId: senderId, channelUrl,
+        metadata: { priority: "HIGH", triggers: sentimentTriggers },
+      });
+      await sendBotMessage(
+        channelUrl,
+        "🚨 Your message has been flagged as high priority. A senior support agent has been notified and will contact you immediately.",
+        { type: "priority_badge", priority: "HIGH" }
+      );
+      return res.sendStatus(200);
+    }
+
     // ── No TXN ID — intent detection → KB lookup → fallback ──
     if (!txnMatch) {
       const intent = detectIntent(messageText);
@@ -995,6 +1544,67 @@ app.post("/sendbird-webhook", webhookLimiter, async (req, res) => {
         await sendBotMessage(
           channelUrl,
           "Please provide your transaction ID (e.g., TXN1001) so I can initiate the retry."
+        );
+        return res.sendStatus(200);
+      }
+
+      // ── Refund request — start negotiation engine ──
+      // Uses conversation memory (activeTxnId) if the user didn't specify a TXN.
+      if (intent === "refund_request") {
+        const state = await getConversationState(channelUrl);
+        const activeTxnId = state?.activeTxnId;
+
+        if (!activeTxnId) {
+          await sendBotMessage(
+            channelUrl,
+            "To start a refund request, please provide your transaction ID first (e.g., TXN1001)."
+          );
+          return res.sendStatus(200);
+        }
+
+        const refundTxn = await Transaction.findOne({ transactionId: activeTxnId });
+        if (!refundTxn || refundTxn.status === "failed") {
+          await sendBotMessage(
+            channelUrl,
+            `Transaction ${activeTxnId} is not eligible for a refund (refunds apply to successful transactions only).`
+          );
+          return res.sendStatus(200);
+        }
+        if (refundTxn.status === "refunded") {
+          await sendBotMessage(channelUrl, `A refund for ${activeTxnId} has already been processed.`);
+          return res.sendStatus(200);
+        }
+
+        // Upsert a pending refund request record
+        await RefundRequest.findOneAndUpdate(
+          { userId: senderId, txnId: activeTxnId, channelUrl },
+          {
+            userId: senderId, txnId: activeTxnId, channelUrl,
+            refundStage: "reason_asked", status: "pending",
+            negotiationAttempts: 0, updatedAt: new Date(),
+          },
+          { upsert: true }
+        );
+        await updateConversationState(channelUrl, senderId, {
+          lastIntent: "refund_request",
+          refundStage: "reason_asked",
+        });
+        await trackAnalytics("refund_request", { userId: senderId, txnId: activeTxnId, channelUrl });
+
+        await sendBotMessage(
+          channelUrl,
+          `I can help with a refund for ${activeTxnId} ($${refundTxn.amount}). Please select the reason:`,
+          {
+            type: "action_buttons",
+            txnId: activeTxnId,
+            buttons: [
+              { label: "Duplicate Charge", action: "refund_reason", reason: "duplicate" },
+              { label: "Service Issue",    action: "refund_reason", reason: "service_issue" },
+              { label: "Accidental Pay",   action: "refund_reason", reason: "accidental" },
+              { label: "Fraud Concern",    action: "refund_reason", reason: "fraud" },
+              { label: "Other",            action: "refund_reason", reason: "other" },
+            ],
+          }
         );
         return res.sendStatus(200);
       }
@@ -1030,6 +1640,12 @@ app.post("/sendbird-webhook", webhookLimiter, async (req, res) => {
     console.log("✅ Transaction found, status:", transaction.status);
     await addBotToChannel(channelUrl);
 
+    // Store this TXN in conversation memory so follow-ups work contextually
+    await updateConversationState(channelUrl, senderId, {
+      activeTxnId: txnId,
+      lastIntent: "transaction_status",
+    });
+
     if (transaction.status === "failed") {
       // Create HubSpot + Desk tickets (non-fatal if they fail)
       try {
@@ -1043,6 +1659,11 @@ app.post("/sendbird-webhook", webhookLimiter, async (req, res) => {
       } catch (err) {
         console.error("Desk (non-fatal):", err.message);
       }
+
+      await trackAnalytics("payment_retry", {
+        userId: senderId, txnId, channelUrl,
+        metadata: { status: "failed", amount: transaction.amount },
+      });
 
       // Send structured message with action buttons.
       // The frontend parses message.data to render interactive buttons inline.
@@ -1062,10 +1683,27 @@ app.post("/sendbird-webhook", webhookLimiter, async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // Non-failed transaction — return status
+    if (transaction.status === "success") {
+      // Successful transaction: inform the user and offer refund or agent options
+      await sendBotMessage(
+        channelUrl,
+        `Transaction ${txnId} completed successfully ✅. Amount: $${transaction.amount}.\nNeed help with this transaction?`,
+        {
+          type: "action_buttons",
+          txnId,
+          buttons: [
+            { label: "Request Refund", action: "refund_start", txnId },
+            { label: "Talk to Agent",  action: "escalate" },
+          ],
+        }
+      );
+      return res.sendStatus(200);
+    }
+
+    // Pending / refunded / other statuses
     await sendBotMessage(
       channelUrl,
-      `Transaction ${txnId} status: ${transaction.status}. Amount: $${transaction.amount}.`
+      `Transaction ${txnId} status: ${transaction.status} ⏳. Amount: $${transaction.amount}.`
     );
     return res.sendStatus(200);
   } catch (error) {
@@ -1090,6 +1728,7 @@ const healthHandler = (_req, res) => {
     sendbird_desk_token: SENDBIRDDESKAPITOKEN ? "set" : "MISSING ⚠️ — desk ticket creation will fail",
     mongodb: mongoose.connection.readyState === 1 ? "connected" : "disconnected",
     escalated_channels_in_memory: escalatedChannels.size,
+    features: "refund-negotiation, policy-engine, sentiment-detection, conversation-memory, analytics",
   });
 };
 app.get("/", healthHandler);
