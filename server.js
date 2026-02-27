@@ -138,9 +138,9 @@ mongoose
   .connect(MONGO_URI)
   .then(() => {
     console.log("MongoDB Connected");
-    seedTransactions();
     ensureBotUser();
     loadEscalatedChannels();
+    // Transactions are seeded per-user on first interaction via ensureUserTransactions()
   })
   .catch((err) => console.error("Mongo Error:", err));
 
@@ -149,11 +149,13 @@ mongoose
 // ===============================
 const transactionSchema = new mongoose.Schema({
   transactionId: String,
+  userId: String,       // ← scopes each record to one user; prevents one user's
+                        //   refund/retry from changing another user's record
   amount: Number,
   status: String,
   userEmail: String,
-  paymentIntentId: String,  // Stripe payment_intent ID — stored after checkout; used for actual refund API calls
-  refundedAmount: Number,   // set when a partial or full refund is issued
+  paymentIntentId: String,
+  refundedAmount: Number,
 });
 const Transaction = mongoose.model("Transaction", transactionSchema);
 
@@ -655,18 +657,23 @@ async function generateNaturalResponse(contextData) {
 }
 
 // ===============================
-// SEED
+// PER-USER TRANSACTION SEEDING
+// Creates 5 demo transactions scoped to the given userId if none exist yet.
+// Using userId as the isolation key means one user's refund/status update
+// never touches another user's records — the root cause of the global-update bug.
 // ===============================
-async function seedTransactions() {
-  const count = await Transaction.countDocuments();
-  if (count === 0) {
-    await Transaction.insertMany([
-      { transactionId: "TXN1001", amount: 500, status: "failed", userEmail: "rahul@test.com" },
-      { transactionId: "TXN1002", amount: 1200, status: "success", userEmail: "rahul@test.com" },
-      { transactionId: "TXN1003", amount: 300, status: "pending", userEmail: "rahul@test.com" },
-    ]);
-    console.log("Seed data inserted");
-  }
+async function ensureUserTransactions(userId) {
+  const count = await Transaction.countDocuments({ userId });
+  if (count > 0) return; // already seeded for this user
+
+  await Transaction.insertMany([
+    { transactionId: "TXN1001", userId, amount: 500,  status: "failed",  userEmail: `${userId}@test.com` },
+    { transactionId: "TXN1002", userId, amount: 1200, status: "success", userEmail: `${userId}@test.com` },
+    { transactionId: "TXN1003", userId, amount: 300,  status: "pending", userEmail: `${userId}@test.com` },
+    { transactionId: "TXN1004", userId, amount: 750,  status: "success", userEmail: `${userId}@test.com` },
+    { transactionId: "TXN1005", userId, amount: 200,  status: "failed",  userEmail: `${userId}@test.com` },
+  ]);
+  console.log(`✅ 5 demo transactions seeded for user: ${userId}`);
 }
 
 // ===============================
@@ -969,9 +976,10 @@ async function processRefundInternal(txnId, channelUrl, userId, transaction, amo
     console.log(`[DEMO] Refund for ${txnId}: $${refundAmount} — no Stripe paymentIntentId, test mode only`);
   }
 
-  // Update transaction status and record refunded amount
+  // Update transaction status — scoped to userId so one user's refund
+  // never mutates the same TXN record for a different user.
   await Transaction.updateOne(
-    { transactionId: txnId },
+    { transactionId: txnId, userId },
     { status: "refunded", refundedAmount: refundAmount }
   );
 
@@ -1066,7 +1074,7 @@ app.post("/retry-payment", async (req, res) => {
       return res.status(400).json({ error: "txnId, channelUrl, and userId are required" });
     }
 
-    const transaction = await Transaction.findOne({ transactionId: txnId.toUpperCase() });
+    const transaction = await Transaction.findOne({ transactionId: txnId.toUpperCase(), userId });
     if (!transaction) {
       return res.status(404).json({ error: `Transaction ${txnId} not found` });
     }
@@ -1245,7 +1253,7 @@ app.post("/refund-action", async (req, res) => {
     }
 
     const txnKey = txnId.toUpperCase();
-    const transaction = await Transaction.findOne({ transactionId: txnKey });
+    const transaction = await Transaction.findOne({ transactionId: txnKey, userId });
     if (!transaction) return res.status(404).json({ error: `Transaction ${txnId} not found` });
 
     await addBotToChannel(channelUrl);
@@ -1307,7 +1315,7 @@ app.post("/refund-action", async (req, res) => {
       // For duplicate claims: check last 5 transactions for a same-amount match
       let hasDuplicate = false;
       if (reason === "duplicate") {
-        const recentTxns = await Transaction.find({ userEmail: transaction.userEmail })
+        const recentTxns = await Transaction.find({ userId })
           .sort({ _id: -1 }).limit(5);
         hasDuplicate = recentTxns.some(
           (t) => t.amount === transaction.amount && t.transactionId !== txnKey
@@ -1490,7 +1498,7 @@ app.post("/process-refund", async (req, res) => {
     }
 
     const txnKey = txnId.toUpperCase();
-    const transaction = await Transaction.findOne({ transactionId: txnKey });
+    const transaction = await Transaction.findOne({ transactionId: txnKey, userId });
     if (!transaction) return res.status(404).json({ error: `Transaction ${txnId} not found` });
 
     // Gate: an approved/pending RefundRequest must exist for authorization
@@ -1705,7 +1713,7 @@ app.post("/payment-webhook", async (req, res) => {
         // Store the Stripe payment_intent ID so we can issue refunds later via the API
         const updateFields = { status: "success" };
         if (session.payment_intent) updateFields.paymentIntentId = session.payment_intent;
-        await Transaction.updateOne({ transactionId: txnId }, updateFields);
+        await Transaction.updateOne({ transactionId: txnId, userId }, updateFields);
         console.log(`✅ Transaction ${txnId} updated to success via Stripe webhook`);
         await trackAnalytics("payment_retry", {
           userId, txnId, channelUrl,
@@ -1853,7 +1861,7 @@ app.post("/sendbird-webhook", webhookLimiter, async (req, res) => {
       // If LLM extracted a TXN ID from context (e.g. "my last payment" + history),
       // treat it like a direct TXN lookup rather than asking the user again.
       if (llmTxnId && /^TXN\d+$/i.test(llmTxnId)) {
-        const inferredTxn = await Transaction.findOne({ transactionId: llmTxnId.toUpperCase() });
+        const inferredTxn = await Transaction.findOne({ transactionId: llmTxnId.toUpperCase(), userId: senderId });
         if (inferredTxn) {
           console.log(`[LLM] Inferred TXN from context: ${llmTxnId}`);
           await updateConversationState(channelUrl, senderId, {
@@ -1927,7 +1935,7 @@ app.post("/sendbird-webhook", webhookLimiter, async (req, res) => {
           return res.sendStatus(200);
         }
 
-        const refundTxn = await Transaction.findOne({ transactionId: activeTxnId });
+        const refundTxn = await Transaction.findOne({ transactionId: activeTxnId, userId: senderId });
         if (!refundTxn || refundTxn.status === "failed") {
           await sendBotMessage(
             channelUrl,
@@ -2009,10 +2017,11 @@ app.post("/sendbird-webhook", webhookLimiter, async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // ── TXN ID found ──
+    // ── TXN ID found ── ensure this user has transactions seeded, then look up
     const txnId = txnMatch[0].toUpperCase();
-    console.log("🔍 Looking up transaction:", txnId);
-    const transaction = await Transaction.findOne({ transactionId: txnId });
+    await ensureUserTransactions(senderId);
+    console.log("🔍 Looking up transaction:", txnId, "for user:", senderId);
+    const transaction = await Transaction.findOne({ transactionId: txnId, userId: senderId });
 
     if (!transaction) {
       await addBotToChannel(channelUrl);
@@ -2115,6 +2124,115 @@ app.post("/sendbird-webhook", webhookLimiter, async (req, res) => {
 });
 
 // ----------------------------------------------------------
+// POST /transaction-list
+// Returns the last 5 transactions for a user as interactive buttons so the
+// user can tap one to see its details — no need to type a TXN ID.
+// Body: { channelUrl, userId }
+// ----------------------------------------------------------
+app.post("/transaction-list", async (req, res) => {
+  try {
+    const { channelUrl, userId } = req.body;
+    if (!channelUrl || !userId) {
+      return res.status(400).json({ error: "channelUrl and userId are required" });
+    }
+
+    await addBotToChannel(channelUrl);
+    await ensureUserTransactions(userId);
+
+    const txns = await Transaction.find({ userId }).sort({ _id: -1 }).limit(5);
+    if (!txns.length) {
+      await sendBotMessage(channelUrl, "No transactions found for your account.");
+      return res.json({ success: true });
+    }
+
+    const STATUS_EMOJI = { failed: "❌", success: "✅", pending: "⏳", refunded: "💚" };
+
+    await sendBotMessage(
+      channelUrl,
+      "Here are your recent transactions — tap one to manage it:",
+      {
+        type: "action_buttons",
+        buttons: txns.map((t) => ({
+          label: `${t.transactionId}  ·  $${t.amount}  ·  ${STATUS_EMOJI[t.status] || "?"} ${t.status}`,
+          action: "view_transaction",
+          txnId: t.transactionId,
+        })),
+      }
+    );
+
+    return res.json({ success: true });
+  } catch (err) {
+    return handleError(res, err, "transaction-list");
+  }
+});
+
+// ----------------------------------------------------------
+// POST /view-transaction
+// Looks up a specific transaction for this user and replies with its status
+// + action buttons tailored to that status (retry / refund / talk to agent).
+// Body: { channelUrl, userId, txnId }
+// ----------------------------------------------------------
+app.post("/view-transaction", async (req, res) => {
+  try {
+    const { channelUrl, userId, txnId } = req.body;
+    if (!channelUrl || !userId || !txnId) {
+      return res.status(400).json({ error: "channelUrl, userId, and txnId are required" });
+    }
+
+    const txnKey = txnId.toUpperCase();
+    const transaction = await Transaction.findOne({ transactionId: txnKey, userId });
+    if (!transaction) {
+      return res.status(404).json({ error: `Transaction ${txnId} not found` });
+    }
+
+    await addBotToChannel(channelUrl);
+
+    // Persist in conversation memory so follow-up messages (e.g. "refund it") resolve correctly
+    await updateConversationState(channelUrl, userId, {
+      activeTxnId: txnKey,
+      lastIntent: "transaction_status",
+    });
+
+    // Status-specific action buttons — only surface actions that make sense
+    const BUTTON_MAP = {
+      failed:   [
+        { label: "🔄 Retry Payment",  action: "retry_payment", txnId: txnKey },
+        { label: "👤 Talk to Agent",  action: "escalate" },
+        { label: "📚 FAQ",            action: "faq" },
+      ],
+      success:  [
+        { label: "💰 Request Refund", action: "refund_start",  txnId: txnKey },
+        { label: "👤 Talk to Agent",  action: "escalate" },
+      ],
+      pending:  [
+        { label: "👤 Talk to Agent",  action: "escalate" },
+        { label: "📚 FAQ",            action: "faq" },
+      ],
+      refunded: [
+        { label: "👤 Talk to Agent",  action: "escalate" },
+      ],
+    };
+
+    const buttons = BUTTON_MAP[transaction.status] || [{ label: "👤 Talk to Agent", action: "escalate" }];
+
+    // LLM generates a natural-sounding status message; falls back to static text
+    const msg = await generateNaturalResponse({
+      intent: "transaction_status",
+      txnId: txnKey,
+      status: transaction.status,
+      amount: transaction.amount,
+      extra: `Transaction ${txnKey} · $${transaction.amount} · Status: ${transaction.status}`,
+    });
+
+    await sendBotMessage(channelUrl, msg, { type: "action_buttons", txnId: txnKey, buttons });
+
+    return res.json({ success: true });
+  } catch (err) {
+    return handleError(res, err, "view-transaction");
+  }
+});
+
+// ----------------------------------------------------------
 // POST /welcome
 // Called by the frontend the first time a channel is opened (0 messages).
 // Sends a greeting with category quick-action buttons so the user always
@@ -2129,8 +2247,10 @@ app.post("/welcome", async (req, res) => {
       return res.status(400).json({ error: "channelUrl and userId are required" });
     }
 
-    // Only send once per channel — if any prior conversation state exists,
-    // the user has already interacted and doesn't need the welcome flow again.
+    // Seed transactions for this user on first contact (idempotent)
+    await ensureUserTransactions(userId);
+
+    // Only send the greeting once per channel — skip if conversation already started
     const state = await getConversationState(channelUrl);
     if (state?.lastIntent) {
       return res.json({ success: true, skipped: true });
