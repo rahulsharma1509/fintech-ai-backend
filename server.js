@@ -440,10 +440,10 @@ async function createDeskTicket(channelUrl, userId) {
     console.warn(`⚠️ Adding members to Desk channel failed (non-fatal): HTTP ${err.response?.status} — ${JSON.stringify(err.response?.data) || err.message}`);
   }
 
-  // Step 4: Send activation message via Chat Platform API.
-  // NOTE: Desk Platform API /tickets/{id}/messages returns 404 (endpoint does not exist).
-  // The Chat API message IS delivered to the Desk backing channel but does NOT
-  // trigger INITIALIZED → UNASSIGNED on its own — direct assignment in Step 5 does.
+  // Step 4: Send initial message as the customer to activate the ticket.
+  // This is what triggers INITIALIZED → UNASSIGNED when agents are connected to the
+  // Desk portal (auto-routing fires). Uses the Chat Platform API — the Desk Platform
+  // API /tickets/{id}/messages endpoint returns 404 and does not exist.
   try {
     await axios.post(
       `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/group_channels/${deskChannelUrl}/messages`,
@@ -457,78 +457,6 @@ async function createDeskTicket(channelUrl, userId) {
     console.log(`✅ Activation message sent via Chat Platform API`);
   } catch (err) {
     console.warn(`⚠️ Chat API activation message failed (non-fatal): HTTP ${err.response?.status} — ${JSON.stringify(err.response?.data) || err.message}`);
-  }
-
-  // Step 5: Move ticket from INITIALIZED → UNASSIGNED (visible in All Tickets).
-  //
-  // The desired flow: All Tickets (UNASSIGNED) → auto-routing → My Tickets (IN_PROGRESS).
-  // Sendbird Desk only auto-activates INITIALIZED tickets when the agent is actively
-  // connected, so we must trigger the transition manually via the Platform API.
-  //
-  // Attempt order (cleanest → most reliable):
-  //   A. PATCH /tickets/{id} with status2=UNASSIGNED — direct status update
-  //   B. PUT   /tickets/{id}/assign then cancel     — assign+cancel round-trip
-  //      (assigns to any active agent to activate the ticket, then immediately cancels
-  //       so it lands in UNASSIGNED / All Tickets queue for agents to pick up)
-  try {
-    const agentsRes = await axios.get(`${baseUrl}/agents?status=ACTIVE&limit=1`, { headers });
-    const agents = agentsRes.data.results || [];
-    console.log(`👥 Available agents: ${agents.length}`);
-    const agent = agents[0] || null;
-
-    let unassigned = false;
-
-    // Attempt A: direct status update
-    if (!unassigned) {
-      try {
-        await axios.patch(`${baseUrl}/tickets/${ticketId}`, { status2: "UNASSIGNED" }, { headers });
-        console.log(`✅ Ticket #${ticketId} moved to UNASSIGNED via PATCH — visible in All Tickets`);
-        unassigned = true;
-      } catch (e) {
-        console.warn(`⚠️ PATCH status2=UNASSIGNED failed: HTTP ${e.response?.status} — ${JSON.stringify(e.response?.data)}`);
-      }
-    }
-
-    // Attempt B: assign+cancel round-trip to activate ticket then release to UNASSIGNED queue
-    if (!unassigned && agent) {
-      let assigned = false;
-      try {
-        await axios.put(`${baseUrl}/tickets/${ticketId}/assign`, { agentId: agent.id }, { headers });
-        console.log(`✅ Ticket #${ticketId} temporarily assigned to agent ${agent.id}`);
-        assigned = true;
-      } catch (e) {
-        console.warn(`⚠️ PUT /assign failed: HTTP ${e.response?.status} — ${JSON.stringify(e.response?.data)}`);
-      }
-
-      if (assigned) {
-        // Cancel assignment → ticket moves to UNASSIGNED (All Tickets)
-        let cancelled = false;
-        for (const [method, url, body] of [
-          ["delete", `${baseUrl}/tickets/${ticketId}/agents/${agent.id}`, null],
-          ["post",   `${baseUrl}/tickets/${ticketId}/cancel_assignment`,  { agentId: agent.id }],
-        ]) {
-          try {
-            await axios({ method, url, data: body, headers });
-            console.log(`✅ Assignment cancelled via ${method.toUpperCase()} — ticket #${ticketId} now UNASSIGNED (All Tickets)`);
-            cancelled = true;
-            unassigned = true;
-            break;
-          } catch (e) {
-            console.warn(`⚠️ Cancel via ${method.toUpperCase()} ${url.split("/").pop()} failed: HTTP ${e.response?.status} — ${JSON.stringify(e.response?.data)}`);
-          }
-        }
-        if (!cancelled) {
-          console.warn(`⚠️ Could not cancel assignment — ticket #${ticketId} stays assigned to agent (visible in My Tickets)`);
-          unassigned = true; // at least it's visible
-        }
-      }
-    }
-
-    if (!unassigned) {
-      console.warn(`⚠️ All activation attempts failed — ticket #${ticketId} is INITIALIZED (only findable by search)`);
-    }
-  } catch (err) {
-    console.warn(`⚠️ Step 5 failed (non-fatal): ${err.message}`);
   }
 
   return { ticketId, deskChannelUrl };
@@ -964,59 +892,6 @@ app.post("/payment-webhook", async (req, res) => {
     return res.sendStatus(200);
   } catch (err) {
     return handleError(res, err, "payment-webhook");
-  }
-});
-
-// ----------------------------------------------------------
-// POST /desk-webhook
-// Handles Sendbird DESK webhook events (configured separately in the Sendbird
-// Desk portal under Settings → Webhooks → add your server URL + /desk-webhook).
-//
-// The Desk portal fires "ticket:message_create" whenever an agent replies in a
-// ticket — the regular Chat webhook does NOT receive these.  We use this to
-// relay agent messages back to the customer's original channel.
-// ----------------------------------------------------------
-app.post("/desk-webhook", webhookLimiter, async (req, res) => {
-  res.sendStatus(200); // acknowledge immediately
-  try {
-    const event = req.body;
-    console.log("📬 Desk webhook received:", JSON.stringify(event).slice(0, 400));
-
-    // Sendbird Desk fires several categories; we only care about agent messages.
-    // Known categories: ticket:message_create, ticket:created, ticket:assigned,
-    // ticket:closed, ticket:reopened
-    const category = event.category || event.type || "";
-    if (!category.includes("message")) return;
-
-    // Payload shape can vary by Desk SDK version — handle both known shapes.
-    const ticketChannelUrl =
-      event.ticket?.channelUrl ||
-      event.ticket?.channel_url ||
-      event.channel?.channel_url ||
-      event.channelUrl;
-
-    const senderType  = (event.sender?.type  || event.message?.sender?.type  || "").toUpperCase();
-    const messageText =  event.message?.plainText ||
-                         event.message?.message   ||
-                         event.payload?.message   || "";
-
-    console.log(`📬 Desk webhook — category: ${category}, senderType: ${senderType}, channel: ${ticketChannelUrl}, message: "${messageText}"`);
-
-    // Only relay AGENT messages (not customer messages — those are already in the
-    // original channel; relaying them back would create a duplicate).
-    if (senderType !== "AGENT" && senderType !== "BOT") return;
-    if (!messageText || !ticketChannelUrl) return;
-
-    const mapping = await ChannelMapping.findOne({ deskChannelUrl: ticketChannelUrl });
-    if (!mapping) {
-      console.warn(`⚠️ Desk webhook: no mapping for desk channel ${ticketChannelUrl}`);
-      return;
-    }
-
-    await sendBotMessage(mapping.originalChannelUrl, `[Support Agent]: ${messageText}`);
-    console.log(`✅ Agent reply relayed to customer channel ${mapping.originalChannelUrl}`);
-  } catch (err) {
-    console.error("Desk webhook error:", err.message);
   }
 });
 
