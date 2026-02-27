@@ -673,6 +673,28 @@ async function loadEscalatedChannels() {
 }
 
 // ===============================
+// DESK CHANNEL HELPER
+// Returns the backing Desk channel URL for a customer channel.
+// Creates a new Desk ticket if one doesn't exist yet, otherwise looks up
+// the existing mapping from MongoDB.  Always returns null on failure so
+// callers can proceed without crashing when Desk is unavailable.
+// ===============================
+async function getOrCreateDeskChannel(channelUrl, userId) {
+  if (!escalatedChannels.has(channelUrl)) {
+    try {
+      const ticket = await createDeskTicket(channelUrl, userId);
+      escalatedChannels.add(channelUrl);
+      return ticket?.deskChannelUrl || null;
+    } catch (err) {
+      console.error("getOrCreateDeskChannel — createDeskTicket failed:", err.message);
+      return null;
+    }
+  }
+  const mapping = await ChannelMapping.findOne({ originalChannelUrl: channelUrl });
+  return mapping?.deskChannelUrl || null;
+}
+
+// ===============================
 // INTERNAL REFUND PROCESSOR
 // Single function that executes a refund end-to-end:
 //   1. Stripe refund API (if paymentIntentId stored and Stripe configured)
@@ -1109,24 +1131,61 @@ app.post("/refund-action", async (req, res) => {
         });
 
       } else if (policyResult.action === "ESCALATE_HIGH") {
-        if (!escalatedChannels.has(channelUrl)) {
-          try { await createDeskTicket(channelUrl, userId); escalatedChannels.add(channelUrl); } catch (e) { console.error(e.message); }
-        }
+        // Create Desk ticket (or reuse existing) and get its channel URL
+        const deskUrl = await getOrCreateDeskChannel(channelUrl, userId);
+
+        // Notify customer
         await sendBotMessage(channelUrl, policyResult.message,
           { type: "priority_badge", priority: "HIGH", txnId: txnKey }
         );
+
+        // Send full refund context to the Desk agent so they know exactly why
+        // the customer was escalated before they even say hello.
+        if (deskUrl) {
+          await sendBotMessage(
+            deskUrl,
+            `🚨 HIGH PRIORITY — Refund Escalation\n\n` +
+            `Customer : ${userId}\n` +
+            `Transaction : ${txnKey}  ·  $${transaction.amount}\n` +
+            `Refund Reason : Fraud Concern\n\n` +
+            `⚠️  Customer has reported a potential fraud on this transaction.\n` +
+            `Action Required : Please investigate immediately and contact the customer.`
+          );
+        }
         await trackAnalytics("escalation", {
           userId, txnId: txnKey, channelUrl,
           metadata: { reason, priority: "HIGH" },
         });
 
       } else { // ESCALATE_NORMAL
-        if (!escalatedChannels.has(channelUrl)) {
-          try { await createDeskTicket(channelUrl, userId); escalatedChannels.add(channelUrl); } catch (e) { console.error(e.message); }
-        }
+        // Human-readable reason labels for the Desk agent message
+        const REASON_LABELS = {
+          duplicate:     "Duplicate Charge (could not be auto-verified)",
+          service_issue: "Service Issue",
+          accidental:    "Accidental Payment (50% offer was presented)",
+          other:         "Other / Unspecified",
+        };
+
+        // Create Desk ticket (or reuse existing) and get its channel URL
+        const deskUrl = await getOrCreateDeskChannel(channelUrl, userId);
+
+        // Notify customer
         await sendBotMessage(channelUrl, policyResult.message,
           { type: "priority_badge", priority: "NORMAL", txnId: txnKey }
         );
+
+        // Send refund context to the Desk agent
+        if (deskUrl) {
+          await sendBotMessage(
+            deskUrl,
+            `📋 Refund Escalation — Agent Review Required\n\n` +
+            `Customer : ${userId}\n` +
+            `Transaction : ${txnKey}  ·  $${transaction.amount}\n` +
+            `Refund Reason : ${REASON_LABELS[reason] || reason}\n\n` +
+            `The automated policy engine could not resolve this request.\n` +
+            `Please review and process the refund manually.`
+          );
+        }
         await trackAnalytics("escalation", {
           userId, txnId: txnKey, channelUrl,
           metadata: { reason, priority: "NORMAL" },
