@@ -126,6 +126,7 @@ const channelMappingSchema = new mongoose.Schema({
   deskChannelUrl: { type: String, unique: true },
   originalChannelUrl: String,
   userId: String,
+  ticketId: String,
   createdAt: { type: Date, default: Date.now },
 });
 const ChannelMapping = mongoose.model("ChannelMapping", channelMappingSchema);
@@ -413,30 +414,9 @@ async function createDeskTicket(channelUrl, userId) {
     console.error("⚠️ Channel mapping save failed (non-fatal):", err.message);
   }
 
-  // Step 3: Invite customer to the Desk backing channel via the correct /invite endpoint.
-  // This is CRITICAL — the customer must be a channel member before Step 4 can send a message.
-  // (PUT /members is for other operations; POST /invite is the correct add-member endpoint.)
-  await axios.post(
-    `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/group_channels/${deskChannelUrl}/invite`,
-    { user_ids: [userId] },
-    { headers: { "Api-Token": SENDBIRD_API_TOKEN, "Content-Type": "application/json" } }
-  );
-  console.log(`✅ Customer ${userId} invited to Desk channel`);
-
-  // Invite online agents too (non-fatal — Desk manages agent assignment separately)
-  try {
-    const agentIds = await getOnlineAgents();
-    if (agentIds.length > 0) {
-      await axios.post(
-        `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/group_channels/${deskChannelUrl}/invite`,
-        { user_ids: agentIds },
-        { headers: { "Api-Token": SENDBIRD_API_TOKEN, "Content-Type": "application/json" } }
-      );
-      console.log(`✅ Agents invited to Desk channel: ${agentIds.join(", ")}`);
-    }
-  } catch (err) {
-    console.error("⚠️ Agent invitation failed (non-fatal):", err.response?.status, err.message);
-  }
+  // Step 3: Sendbird Desk automatically adds the customer as a member of the
+  // backing channel when the ticket is created — no manual invite needed.
+  // (Attempting to invite via the Chat Platform API causes a 500 on Desk channels.)
 
   // Step 4: Send initial message from the customer to activate the ticket.
   // Until a customer message arrives the ticket stays in INITIALIZED status
@@ -679,12 +659,9 @@ app.post("/escalate", async (req, res) => {
               console.warn(`⚠️ Ticket #${mapping.ticketId} is ${ticketStatus} (invisible to agents) — will re-escalate.`);
             }
           } else {
-            // No ticketId stored — check if the Sendbird channel still exists
-            await axios.get(
-              `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/group_channels/${mapping.deskChannelUrl}`,
-              { headers: { "Api-Token": SENDBIRD_API_TOKEN } }
-            );
-            ticketIsActive = true; // assume live if channel exists and no ticketId to check
+            // No ticketId stored — mapping is from before ticketId was tracked.
+            // Treat as stale so a fresh ticket (with proper tracking) is created.
+            console.warn("⚠️ No ticketId in mapping — treating as stale, will re-escalate.");
           }
         } catch {
           console.warn("⚠️ Could not verify ticket status — re-escalating to be safe.");
@@ -734,6 +711,19 @@ app.post("/escalate", async (req, res) => {
 // ----------------------------------------------------------
 // GET /debug-desk?userId=<userId>
 // Diagnostic endpoint: tests Desk API connectivity step-by-step
+// ----------------------------------------------------------
+// DELETE /clear-escalation?channelUrl=<url>
+// Clears the stale escalation state for a channel so a fresh ticket can be created.
+// ----------------------------------------------------------
+app.delete("/clear-escalation", async (req, res) => {
+  const { channelUrl } = req.query;
+  if (!channelUrl) return res.status(400).json({ error: "channelUrl query param required" });
+  escalatedChannels.delete(channelUrl);
+  const del = await ChannelMapping.deleteOne({ originalChannelUrl: channelUrl });
+  res.json({ success: true, deleted: del.deletedCount, channelUrl });
+});
+
+// ----------------------------------------------------------
 // and returns the raw API responses so we can see what the Desk
 // API actually creates and where the ticket ends up.
 // ----------------------------------------------------------
