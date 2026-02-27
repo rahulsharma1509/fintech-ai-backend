@@ -2002,9 +2002,9 @@ app.post("/sendbird-webhook", webhookLimiter, async (req, res) => {
           ];
 
       await sendBotMessage(channelUrl, fallbackText, {
-        // custom_type "SUGGESTIONS" signals the frontend to render these as buttons
-        type: "SUGGESTIONS",
-        suggestions: suggestionButtons,
+        // action_buttons matches the format the frontend already renders
+        type: "action_buttons",
+        buttons: suggestionButtons,
       });
       return res.sendStatus(200);
     }
@@ -2111,6 +2111,53 @@ app.post("/sendbird-webhook", webhookLimiter, async (req, res) => {
   } catch (error) {
     console.error("Webhook error:", error.response?.data || error.message);
     return res.sendStatus(500);
+  }
+});
+
+// ----------------------------------------------------------
+// POST /welcome
+// Called by the frontend the first time a channel is opened (0 messages).
+// Sends a greeting with category quick-action buttons so the user always
+// has a clear starting point without typing anything.
+// Idempotent: if ConversationState already exists the call is a no-op.
+// Body: { channelUrl, userId }
+// ----------------------------------------------------------
+app.post("/welcome", async (req, res) => {
+  try {
+    const { channelUrl, userId } = req.body;
+    if (!channelUrl || !userId) {
+      return res.status(400).json({ error: "channelUrl and userId are required" });
+    }
+
+    // Only send once per channel — if any prior conversation state exists,
+    // the user has already interacted and doesn't need the welcome flow again.
+    const state = await getConversationState(channelUrl);
+    if (state?.lastIntent) {
+      return res.json({ success: true, skipped: true });
+    }
+
+    await addBotToChannel(channelUrl);
+
+    await sendBotMessage(
+      channelUrl,
+      `👋 Hi! I'm your AI financial support assistant.\nI can help you with transactions, refunds, payments, and more — just pick a category or type your question below.`,
+      {
+        type: "action_buttons",
+        buttons: [
+          { label: "🔍 Check Transaction",  action: "check_transaction" },
+          { label: "💰 Request Refund",      action: "ask_refund" },
+          { label: "🔄 Retry a Payment",     action: "ask_retry" },
+          { label: "👤 Talk to Agent",       action: "escalate" },
+          { label: "📚 FAQ & Policies",      action: "faq" },
+        ],
+      }
+    );
+
+    // Mark channel as welcomed so we don't repeat on reconnect
+    await updateConversationState(channelUrl, userId, { lastIntent: "welcome" });
+    return res.json({ success: true });
+  } catch (err) {
+    return handleError(res, err, "welcome");
   }
 });
 
