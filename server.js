@@ -719,9 +719,10 @@ app.post("/escalate", async (req, res) => {
         `In your Sendbird Desk dashboard, go to → All Tickets (or New/Unassigned) to find this ticket.`
       );
     } catch (err) {
-      console.error("Desk ticket creation failed:", err.message);
-      await sendBotMessage(channelUrl, "We're having trouble connecting you right now. Please try again in a moment or email support directly.");
-      return res.status(500).json({ error: "Failed to create support ticket" });
+      const errDetail = `${err.message} | HTTP ${err.response?.status} | ${JSON.stringify(err.response?.data)}`;
+      console.error("Desk ticket creation failed:", errDetail);
+      await sendBotMessage(channelUrl, `DEBUG — ticket creation failed: ${errDetail}`);
+      return res.status(500).json({ error: "Failed to create support ticket", detail: errDetail });
     }
 
     return res.json({ success: true });
