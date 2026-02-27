@@ -414,23 +414,78 @@ async function createDeskTicket(channelUrl, userId) {
     console.error("⚠️ Channel mapping save failed (non-fatal):", err.message);
   }
 
-  // Step 3: Sendbird Desk automatically adds the customer as a member of the
-  // backing channel when the ticket is created — no manual invite needed.
-  // (Attempting to invite via the Chat Platform API causes a 500 on Desk channels.)
+  // Step 3: Try to add agents + customer to the Desk backing channel (non-fatal).
+  // This was the approach that worked on Feb 25. Even if the PUT returns a 500
+  // (Sendbird occasionally rejects Chat API member-management on Desk channels),
+  // we still continue to Step 4 so the activation message always runs.
+  try {
+    let agentIds = [];
+    try {
+      agentIds = await getOnlineAgents();
+    } catch (e) {
+      console.warn("⚠️ getOnlineAgents failed (non-fatal):", e.message);
+    }
+    const memberIds = [userId, ...agentIds];
+    await axios.put(
+      `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/group_channels/${deskChannelUrl}/members`,
+      { user_ids: memberIds },
+      { headers: { "Api-Token": SENDBIRD_API_TOKEN, "Content-Type": "application/json" } }
+    );
+    console.log(`✅ Members added to Desk channel: ${memberIds.join(", ")}`);
+  } catch (err) {
+    console.warn(`⚠️ Adding members to Desk channel failed (non-fatal): HTTP ${err.response?.status} — ${JSON.stringify(err.response?.data) || err.message}`);
+  }
 
-  // Step 4: Send initial message from the customer to activate the ticket.
-  // Until a customer message arrives the ticket stays in INITIALIZED status
-  // and is invisible to agents in the Desk dashboard. This step is CRITICAL.
-  await axios.post(
-    `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/group_channels/${deskChannelUrl}/messages`,
-    {
-      message_type: "MESG",
-      user_id: userId,
-      message: `Hi, I need help with my failed payment. Original channel: ${channelUrl}`,
-    },
-    { headers: { "Api-Token": SENDBIRD_API_TOKEN, "Content-Type": "application/json" } }
-  );
-  console.log(`✅ Activation message sent — ticket should now be UNASSIGNED/visible to agents`);
+  // Step 4: Activate the ticket so it transitions INITIALIZED → UNASSIGNED
+  // and becomes visible to agents in the Desk dashboard.
+  //
+  // Primary: Desk Platform API ticket-message endpoint — this goes through Desk's
+  // own state machine and is the most reliable way to trigger the transition.
+  // Fallback: Chat Platform API — used if the Desk endpoint is unavailable.
+  let deskActivated = false;
+  try {
+    await axios.post(
+      `${baseUrl}/tickets/${ticketId}/messages`,
+      { type: "MESG", message: "Hi, I need help with my account.", customerId },
+      { headers }
+    );
+    console.log(`✅ Activation message sent via Desk Platform API — ticket should be UNASSIGNED`);
+    deskActivated = true;
+  } catch (err) {
+    console.warn(
+      `⚠️ Desk API activation failed (HTTP ${err.response?.status}): ${JSON.stringify(err.response?.data) || err.message} — falling back to Chat API`
+    );
+  }
+
+  if (!deskActivated) {
+    try {
+      await axios.post(
+        `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/group_channels/${deskChannelUrl}/messages`,
+        {
+          message_type: "MESG",
+          user_id: userId,
+          message: `Hi, I need help with my failed payment. Original channel: ${channelUrl}`,
+        },
+        { headers: { "Api-Token": SENDBIRD_API_TOKEN, "Content-Type": "application/json" } }
+      );
+      console.log(`✅ Activation message sent via Chat Platform API`);
+    } catch (err) {
+      console.error(`❌ Chat API activation also failed: HTTP ${err.response?.status} — ${JSON.stringify(err.response?.data) || err.message}`);
+      throw err;
+    }
+  }
+
+  // Verify the ticket actually transitioned out of INITIALIZED
+  try {
+    const statusCheck = await axios.get(`${baseUrl}/tickets/${ticketId}`, { headers });
+    const ticketStatus = statusCheck.data.status2 || statusCheck.data.status;
+    console.log(`🎫 Post-activation ticket status: ${ticketStatus}`);
+    if (ticketStatus === "INITIALIZED") {
+      console.warn("⚠️ Ticket is still INITIALIZED after activation — may not be visible to agents in the dashboard");
+    }
+  } catch (err) {
+    console.warn("⚠️ Post-activation status check failed (non-fatal):", err.message);
+  }
 
   return { ticketId, deskChannelUrl };
 }
