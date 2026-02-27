@@ -292,6 +292,57 @@ const escalatedChannels = new Set();
 const deskChannels = new Set();
 
 // ===============================
+// AGENT-AWAY FALLBACK TIMER
+// When a Desk ticket is created the customer expects an agent to respond quickly.
+// If no agent reply arrives within AGENT_REPLY_TIMEOUT_MS, the bot sends a
+// polite "agent is busy" message so the customer isn't left in silence.
+// The timer is cancelled the moment a real agent reply is forwarded.
+// ===============================
+const AGENT_REPLY_TIMEOUT_MS = parseInt(process.env.AGENT_REPLY_TIMEOUT_MS || "30000", 10);
+const agentAwaitTimers = new Map(); // channelUrl → setTimeout id
+
+function scheduleAgentAwayFallback(channelUrl) {
+  // Reset any existing timer for this channel (e.g. re-escalation)
+  clearAgentAwayTimer(channelUrl);
+
+  const timerId = setTimeout(async () => {
+    agentAwaitTimers.delete(channelUrl);
+    try {
+      // Double-check: if an agent already replied, don't send the fallback
+      const msgRes = await axios.get(
+        `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/group_channels/${channelUrl}/messages` +
+        `?prev_limit=20&message_ts=${Date.now()}&include=false`,
+        { headers: { "Api-Token": SENDBIRD_API_TOKEN } }
+      );
+      const agentReplied = (msgRes.data.messages || []).some(
+        (m) => typeof m.message === "string" && m.message.startsWith("[Support Agent]:")
+      );
+      if (!agentReplied) {
+        await sendBotMessage(
+          channelUrl,
+          "⏳ Our support agent is currently assisting other customers. You're in the queue — we'll be with you shortly. Feel free to type any additional details in the meantime.",
+        );
+        console.log(`⏱ Agent-away message sent to ${channelUrl}`);
+      }
+    } catch (err) {
+      console.warn("⚠️  agentAwayFallback check failed (non-fatal):", err.message);
+    }
+  }, AGENT_REPLY_TIMEOUT_MS);
+
+  agentAwaitTimers.set(channelUrl, timerId);
+  console.log(`⏱ Agent-away timer started for ${channelUrl} (${AGENT_REPLY_TIMEOUT_MS / 1000}s)`);
+}
+
+function clearAgentAwayTimer(channelUrl) {
+  const existing = agentAwaitTimers.get(channelUrl);
+  if (existing) {
+    clearTimeout(existing);
+    agentAwaitTimers.delete(channelUrl);
+    console.log(`✅ Agent-away timer cleared for ${channelUrl} (agent responded)`);
+  }
+}
+
+// ===============================
 // MOCK KNOWLEDGE BASE
 // A simple keyword-indexed FAQ store.  Replace with a real vector/search DB
 // in production.
@@ -916,6 +967,7 @@ async function getOrCreateDeskChannel(channelUrl, userId) {
     try {
       const ticket = await createDeskTicket(channelUrl, userId);
       escalatedChannels.add(channelUrl);
+      scheduleAgentAwayFallback(channelUrl); // start 30-s fallback timer
       return ticket?.deskChannelUrl || null;
     } catch (err) {
       console.error("getOrCreateDeskChannel — createDeskTicket failed:", err.message);
@@ -1216,6 +1268,7 @@ app.post("/escalate", async (req, res) => {
     try {
       const ticket = await createDeskTicket(channelUrl, userId);
       escalatedChannels.add(channelUrl);
+      scheduleAgentAwayFallback(channelUrl); // start 30-s fallback timer
       const ticketRef = ticket?.ticketId ? ` (Ticket #${ticket.ticketId})` : "";
       await sendBotMessage(
         channelUrl,
@@ -1783,6 +1836,8 @@ app.post("/sendbird-webhook", webhookLimiter, async (req, res) => {
       const mapping = await ChannelMapping.findOne({ deskChannelUrl: channelUrl });
       if (mapping && senderId !== mapping.userId) {
         console.log(`📨 Forwarding agent message to customer channel: ${mapping.originalChannelUrl}`);
+        // Agent responded — cancel the "agent is away" fallback timer if it's still running
+        clearAgentAwayTimer(mapping.originalChannelUrl);
         await sendBotMessage(mapping.originalChannelUrl, `[Support Agent]: ${messageText}`);
       }
       return res.sendStatus(200);
@@ -1814,6 +1869,7 @@ app.post("/sendbird-webhook", webhookLimiter, async (req, res) => {
         try {
           await createDeskTicket(channelUrl, senderId);
           escalatedChannels.add(channelUrl);
+          scheduleAgentAwayFallback(channelUrl);
         } catch (err) {
           console.error("High-priority escalation failed:", err.message);
         }
@@ -1902,6 +1958,7 @@ app.post("/sendbird-webhook", webhookLimiter, async (req, res) => {
           try {
             await createDeskTicket(channelUrl, senderId);
             escalatedChannels.add(channelUrl);
+            scheduleAgentAwayFallback(channelUrl);
           } catch (err) {
             console.error("Desk escalation failed (non-fatal):", err.message);
           }
@@ -2051,6 +2108,7 @@ app.post("/sendbird-webhook", webhookLimiter, async (req, res) => {
       try {
         await createDeskTicket(channelUrl, senderId);
         escalatedChannels.add(channelUrl);
+        scheduleAgentAwayFallback(channelUrl);
       } catch (err) {
         console.error("Desk (non-fatal):", err.message);
       }
