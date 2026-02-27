@@ -715,12 +715,17 @@ app.post("/escalate", async (req, res) => {
 // DELETE /clear-escalation?channelUrl=<url>
 // Clears the stale escalation state for a channel so a fresh ticket can be created.
 // ----------------------------------------------------------
-app.delete("/clear-escalation", async (req, res) => {
+app.get("/clear-escalation", async (req, res) => {
   const { channelUrl } = req.query;
-  if (!channelUrl) return res.status(400).json({ error: "channelUrl query param required" });
-  escalatedChannels.delete(channelUrl);
-  const del = await ChannelMapping.deleteOne({ originalChannelUrl: channelUrl });
-  res.json({ success: true, deleted: del.deletedCount, channelUrl });
+  if (channelUrl) {
+    escalatedChannels.delete(channelUrl);
+    const del = await ChannelMapping.deleteOne({ originalChannelUrl: channelUrl });
+    return res.json({ success: true, deleted: del.deletedCount, channelUrl });
+  }
+  // No channelUrl — clear ALL escalation state
+  escalatedChannels.clear();
+  const del = await ChannelMapping.deleteMany({});
+  res.json({ success: true, message: "Cleared all escalation mappings", deleted: del.deletedCount });
 });
 
 // ----------------------------------------------------------
