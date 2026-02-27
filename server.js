@@ -35,6 +35,10 @@ app.use(
   })
 );
 
+// Render (and most PaaS) sit behind a proxy — trust the first hop so that
+// express-rate-limit can read the real client IP from X-Forwarded-For.
+app.set("trust proxy", 1);
+
 // ===============================
 // LOGGING MIDDLEWARE
 // Logs every request with method, path, status code, and duration.
