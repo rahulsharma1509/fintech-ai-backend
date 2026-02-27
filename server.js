@@ -694,6 +694,28 @@ async function getOrCreateDeskChannel(channelUrl, userId) {
   return mapping?.deskChannelUrl || null;
 }
 
+// Sends a context/summary message to a Desk ticket channel so the agent
+// knows why the customer was escalated.  Uses userId (not support_bot)
+// as the sender because Desk channels only reliably accept messages from
+// users who participated in ticket creation.  Non-fatal — a failure here
+// must never break the customer-facing flow.
+async function sendDeskContext(deskChannelUrl, userId, text) {
+  try {
+    await axios.post(
+      `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/group_channels/${deskChannelUrl}/messages`,
+      { message_type: "MESG", user_id: userId, message: text },
+      { headers: { "Api-Token": SENDBIRD_API_TOKEN, "Content-Type": "application/json" } }
+    );
+    console.log(`✅ Desk context message sent to ${deskChannelUrl}`);
+  } catch (err) {
+    console.error(
+      `⚠️  sendDeskContext failed for ${deskChannelUrl}:`,
+      err.response?.status,
+      JSON.stringify(err.response?.data) || err.message
+    );
+  }
+}
+
 // ===============================
 // INTERNAL REFUND PROCESSOR
 // Single function that executes a refund end-to-end:
@@ -1142,8 +1164,9 @@ app.post("/refund-action", async (req, res) => {
         // Send full refund context to the Desk agent so they know exactly why
         // the customer was escalated before they even say hello.
         if (deskUrl) {
-          await sendBotMessage(
-            deskUrl,
+          await sendDeskContext(
+            deskUrl, userId,
+            `[🤖 AI Support — Automated Context]\n\n` +
             `🚨 HIGH PRIORITY — Refund Escalation\n\n` +
             `Customer : ${userId}\n` +
             `Transaction : ${txnKey}  ·  $${transaction.amount}\n` +
@@ -1176,8 +1199,9 @@ app.post("/refund-action", async (req, res) => {
 
         // Send refund context to the Desk agent
         if (deskUrl) {
-          await sendBotMessage(
-            deskUrl,
+          await sendDeskContext(
+            deskUrl, userId,
+            `[🤖 AI Support — Automated Context]\n\n` +
             `📋 Refund Escalation — Agent Review Required\n\n` +
             `Customer : ${userId}\n` +
             `Transaction : ${txnKey}  ·  $${transaction.amount}\n` +
