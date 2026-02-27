@@ -695,11 +695,29 @@ app.post("/escalate", async (req, res) => {
         }
 
         if (ticketIsActive) {
-          await sendBotMessage(
-            channelUrl,
-            `Your support ticket is already open (Ticket #${mapping.ticketId || mapping.deskChannelUrl}). ` +
-            `An agent will join shortly.`
-          );
+          // Check if the agent has already replied in this channel.
+          // If so, skip the bot message — "join shortly" is wrong when they've already joined.
+          let agentHasReplied = false;
+          try {
+            const msgRes = await axios.get(
+              `https://api-${SENDBIRD_APP_ID}.sendbird.com/v3/group_channels/${channelUrl}/messages` +
+              `?prev_limit=20&message_ts=${Date.now()}&include=false`,
+              { headers: { "Api-Token": SENDBIRD_API_TOKEN } }
+            );
+            agentHasReplied = (msgRes.data.messages || []).some(
+              (m) => m.message?.startsWith("[Support Agent]:")
+            );
+          } catch (err) {
+            console.warn("⚠️ Could not fetch channel messages for agent-reply check:", err.message);
+          }
+
+          if (!agentHasReplied) {
+            await sendBotMessage(
+              channelUrl,
+              `Your support ticket is already open (Ticket #${mapping.ticketId || mapping.deskChannelUrl}). ` +
+              `An agent will join shortly.`
+            );
+          }
           return res.json({ success: true, message: "Already escalated" });
         }
 
