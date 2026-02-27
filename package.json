@@ -18,6 +18,7 @@
     "express-rate-limit": "^8.2.1",
     "ioredis": "^5.6.1",
     "mongoose": "^8.23.0",
+    "openai": "^4.104.0",
     "stripe": "^17.7.0"
   }
 }

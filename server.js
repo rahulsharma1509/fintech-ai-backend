@@ -21,6 +21,37 @@ if (process.env.STRIPE_SECRET_KEY) {
 }
 
 // ===============================
+// OPENAI — Hybrid LLM Intent Engine
+// -------------------------------------------------------
+// IMPORTANT: Add the following line to your .env file:
+//   OPENAI_API_KEY=your_key_here
+// DO NOT hardcode the key in this file.
+//
+// Optional: OPENAI_BUDGET_USD=5.00  (default: 5.00)
+// The server will warn you at 60% / 80% usage and stop
+// LLM calls entirely when the budget is exhausted —
+// gracefully falling back to rule-based detection.
+// -------------------------------------------------------
+// ARCHITECTURE NOTE (Hybrid Model):
+//   LLM role  → intent classification, entity extraction, conversational tone
+//   Backend role → ALL financial decisions (refunds, Stripe, Desk escalation)
+//   LLM NEVER directly triggers money movement or ticket creation.
+// ===============================
+let openai = null;
+if (process.env.OPENAI_API_KEY) {
+  try {
+    const OpenAI = require("openai");
+    // apiKey is read from process.env.OPENAI_API_KEY — never hardcoded
+    openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    console.log("✅ OpenAI initialized (model: gpt-4o-mini)");
+  } catch (err) {
+    console.warn("⚠️  openai package missing — run: npm install openai");
+  }
+} else {
+  console.warn("⚠️  OPENAI_API_KEY not set — using rule-based intent detection (no LLM calls)");
+}
+
+// ===============================
 // EXPRESS SETUP
 // express.json verify callback saves req.rawBody only for /payment-webhook
 // so Stripe signature verification works while the rest of the app uses parsed JSON.
@@ -189,6 +220,19 @@ const RegisteredUser = mongoose.model("RegisteredUser", registeredUserSchema);
 
 const USER_LIMIT = 20;
 
+// Tracks cumulative OpenAI token usage and approximate cost so we can warn
+// before the $5 test budget runs out and stop LLM calls when exhausted.
+const tokenBudgetSchema = new mongoose.Schema({
+  _id: { type: String, default: "global" },
+  totalInputTokens:  { type: Number, default: 0 },
+  totalOutputTokens: { type: Number, default: 0 },
+  totalCostUSD:      { type: Number, default: 0 },
+  // ok → warn_60 → warn_80 → exhausted  (one-way ratchet logged once per level)
+  warningLevel: { type: String, default: "ok" },
+  updatedAt: { type: Date, default: Date.now },
+});
+const TokenBudget = mongoose.model("TokenBudget", tokenBudgetSchema);
+
 // ===============================
 // REDIS — optional idempotency store
 // When REDIS_URL is set, processed message IDs are stored in Redis with a
@@ -295,6 +339,68 @@ function queryKnowledgeBase(query) {
     }
   }
   return { found: false, answer: null };
+}
+
+// ===============================
+// OPENAI BUDGET GUARD
+// Persists cumulative cost to MongoDB so restarts don't reset the counter.
+// gpt-4o-mini pricing (2024): $0.150/1M input tokens, $0.600/1M output tokens.
+// ===============================
+const OPENAI_BUDGET_USD = parseFloat(process.env.OPENAI_BUDGET_USD || "5.00");
+const GPT_INPUT_COST_PER_TOKEN  = 0.150 / 1_000_000;
+const GPT_OUTPUT_COST_PER_TOKEN = 0.600 / 1_000_000;
+
+// Called after every successful OpenAI API response to record usage.
+// Non-fatal — a DB failure here must never break user-facing flows.
+async function recordTokenUsage(inputTokens, outputTokens) {
+  try {
+    const cost = (inputTokens  * GPT_INPUT_COST_PER_TOKEN) +
+                 (outputTokens * GPT_OUTPUT_COST_PER_TOKEN);
+
+    const budget = await TokenBudget.findOneAndUpdate(
+      { _id: "global" },
+      {
+        $inc: { totalInputTokens: inputTokens, totalOutputTokens: outputTokens, totalCostUSD: cost },
+        $set: { updatedAt: new Date() },
+      },
+      { upsert: true, new: true }
+    );
+
+    const usedPct = (budget.totalCostUSD / OPENAI_BUDGET_USD) * 100;
+    console.log(
+      `[OpenAI] in:${inputTokens} out:${outputTokens} cost:$${cost.toFixed(6)}` +
+      ` | total $${budget.totalCostUSD.toFixed(4)}/$${OPENAI_BUDGET_USD} (${usedPct.toFixed(1)}%)`
+    );
+
+    // Ratchet warning — each level logged only once
+    if (budget.totalCostUSD >= OPENAI_BUDGET_USD && budget.warningLevel !== "exhausted") {
+      await TokenBudget.updateOne({ _id: "global" }, { warningLevel: "exhausted" });
+      console.error(`🚨 OPENAI BUDGET EXHAUSTED — $${budget.totalCostUSD.toFixed(4)} of $${OPENAI_BUDGET_USD} spent. All LLM calls disabled. Falling back to rule-based detection.`);
+    } else if (usedPct >= 80 && budget.warningLevel === "warn_60") {
+      await TokenBudget.updateOne({ _id: "global" }, { warningLevel: "warn_80" });
+      console.warn(`⚠️  OPENAI BUDGET 80% USED — $${budget.totalCostUSD.toFixed(4)} of $${OPENAI_BUDGET_USD} spent.`);
+    } else if (usedPct >= 60 && budget.warningLevel === "ok") {
+      await TokenBudget.updateOne({ _id: "global" }, { warningLevel: "warn_60" });
+      console.warn(`⚠️  OPENAI BUDGET 60% USED — $${budget.totalCostUSD.toFixed(4)} of $${OPENAI_BUDGET_USD} spent.`);
+    }
+    return budget;
+  } catch (err) {
+    console.warn("⚠️  Budget tracking failed (non-fatal):", err.message);
+    return null;
+  }
+}
+
+// Returns true only when OpenAI is configured AND the budget is not exhausted.
+async function isLLMAvailable() {
+  if (!openai) return false;
+  try {
+    const budget = await TokenBudget.findOne({ _id: "global" });
+    if (budget && budget.totalCostUSD >= OPENAI_BUDGET_USD) {
+      console.warn("🚨 OpenAI budget exhausted — using rule-based fallback");
+      return false;
+    }
+  } catch { /* DB check failure → allow LLM (non-critical) */ }
+  return true;
 }
 
 // ===============================
@@ -405,28 +511,147 @@ async function updateConversationState(channelUrl, userId, updates) {
 }
 
 // ===============================
-// INTENT DETECTION
-// Returns one of: transaction_status | payment_retry | refund_request |
-//                 escalation | faq | unknown
+// INTENT DETECTION — HYBRID LLM + RULE-BASED
+//
+// Primary path : gpt-4o-mini classifies intent, extracts TXN ID, reads sentiment.
+// Fallback path: regex rules (identical behaviour to the original bot).
+//                Kicks in when OpenAI is not configured or budget is exhausted.
+//
+// All returned objects share the same shape:
+//   { intent, transaction_id, sentiment, suggested_action }
+//
+// intent values: transaction_lookup | refund_request | escalation |
+//                faq | retry_payment | unknown
+// sentiment values: neutral | frustrated | angry | happy
 // ===============================
-function detectIntent(message) {
+
+// ── Rule-based fallback (no LLM cost) ───────────────────────────────────────
+function detectIntentRuleBased(message) {
   const lower = (message || "").toLowerCase();
-  if (/txn\d+/i.test(message)) return "transaction_status";
-  if (/\b(retry|pay again|retry payment|repay|try again)\b/.test(lower)) return "payment_retry";
-  // Refund intent checked before generic escalation so "want refund" routes to the
-  // negotiation engine, not straight to a human agent.
-  if (/\b(refund|money back|reimburse|return my money|want refund|need refund|get refund|claim refund)\b/.test(lower)) return "refund_request";
-  if (
-    /\b(human|agent|speak|talk to|connect me|escalate|real person|support team|representative)\b/.test(
-      lower
-    )
-  )
-    return "escalation";
-  if (
-    /\b(cancel|fee|policy|failed|why|how|what|charge|time|long|process|decline)\b/.test(lower)
-  )
-    return "faq";
-  return "unknown";
+  if (/txn\d+/i.test(message))
+    return { intent: "transaction_lookup", transaction_id: (message.match(/TXN\d+/i) || [])[0]?.toUpperCase() || null, sentiment: "neutral", suggested_action: "lookup_transaction" };
+  if (/\b(retry|pay again|retry payment|repay|try again)\b/.test(lower))
+    return { intent: "retry_payment", transaction_id: null, sentiment: "neutral", suggested_action: "retry_payment" };
+  // Refund checked before escalation so "want refund" never skips the negotiation engine
+  if (/\b(refund|money back|reimburse|return my money|want refund|need refund|get refund|claim refund)\b/.test(lower))
+    return { intent: "refund_request", transaction_id: null, sentiment: "neutral", suggested_action: "start_refund_flow" };
+  if (/\b(human|agent|speak|talk to|connect me|escalate|real person|support team|representative)\b/.test(lower))
+    return { intent: "escalation", transaction_id: null, sentiment: "neutral", suggested_action: "create_desk_ticket" };
+  if (/\b(cancel|fee|policy|failed|why|how|what|charge|time|long|process|decline)\b/.test(lower))
+    return { intent: "faq", transaction_id: null, sentiment: "neutral", suggested_action: "query_kb" };
+  return { intent: "unknown", transaction_id: null, sentiment: "neutral", suggested_action: "ask_for_txn_id" };
+}
+
+// ── LLM-powered detection (primary path) ────────────────────────────────────
+// conversationHistory: array of { role: "user"|"assistant", content: string }
+// trimmed to last 10 messages before sending to the API.
+async function detectIntent(message, conversationHistory = []) {
+  if (await isLLMAvailable()) {
+    try {
+      const trimmedHistory = (conversationHistory || []).slice(-10);
+
+      const response = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        temperature: 0,
+        max_tokens: 150, // Intent JSON is tiny; hard cap prevents runaway cost
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are a fintech AI support assistant.\n" +
+              "Analyse the user message and return ONLY valid JSON — no markdown, no explanation:\n" +
+              "{\n" +
+              '  "intent": one of [transaction_lookup, refund_request, escalation, faq, retry_payment, unknown],\n' +
+              '  "transaction_id": "<TXN string if mentioned or inferable from history, else null>",\n' +
+              '  "sentiment": one of [neutral, frustrated, angry, happy],\n' +
+              '  "suggested_action": "<short action string>"\n' +
+              "}\n\n" +
+              "Rules:\n" +
+              "- transaction_lookup  → user asks about a specific payment or transaction\n" +
+              "- refund_request      → user wants money back\n" +
+              "- retry_payment       → user wants to redo / retry a payment\n" +
+              "- escalation          → user wants a human agent\n" +
+              "- faq                 → user asks about policies, fees, timelines\n" +
+              "- unknown             → none of the above\n" +
+              "- Extract transaction_id (format TXN + digits) from message OR conversation history\n" +
+              "- sentiment = angry or frustrated if user sounds upset, impatient, or uses strong language\n" +
+              "JSON only. No extra text.",
+          },
+          ...trimmedHistory.map((m) => ({ role: m.role, content: m.content })),
+          { role: "user", content: message },
+        ],
+      });
+
+      await recordTokenUsage(
+        response.usage.prompt_tokens,
+        response.usage.completion_tokens
+      );
+
+      const parsed = JSON.parse(response.choices[0]?.message?.content?.trim());
+      console.log(`[LLM intent] ${JSON.stringify(parsed)}`);
+      return parsed;
+    } catch (err) {
+      console.warn("⚠️  LLM intent detection failed — using rule-based fallback:", err.message);
+    }
+  }
+  return detectIntentRuleBased(message);
+}
+
+// ===============================
+// NATURAL LANGUAGE RESPONSE GENERATOR
+//
+// Wraps already-validated backend data in a polite, empathetic fintech tone.
+// LLM NEVER decides financial outcomes here — it only rephrases verified data.
+//
+// contextData: { intent, txnId?, status?, amount?, userId?, extra? }
+// extra: deterministic fallback text used when LLM is unavailable.
+// ===============================
+async function generateNaturalResponse(contextData) {
+  const { intent, txnId, status, amount, extra = "" } = contextData;
+
+  if (!(await isLLMAvailable())) {
+    // Deterministic fallback — mirrors the original static messages
+    if (intent === "transaction_status" && txnId) {
+      if (status === "failed")  return `Your transaction ${txnId} ($${amount}) has failed. A support case has been opened. How would you like to proceed?`;
+      if (status === "success") return `Transaction ${txnId} completed successfully ✅. Amount: $${amount}.\nNeed help with this transaction?`;
+    }
+    return extra || "How can I assist you further?";
+  }
+
+  try {
+    const response = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      temperature: 0.3,
+      max_tokens: 120, // Concise responses — keep cost low
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a polite, empathetic fintech customer-support assistant.\n" +
+            "Given backend-verified transaction data, write a short response (2–3 sentences max).\n" +
+            "Rules:\n" +
+            "- Use the EXACT status and amount from the data — never invent or assume financial info\n" +
+            "- Warm but professional tone\n" +
+            "- If transaction failed, briefly acknowledge and offer next steps\n" +
+            "- No jargon, no disclaimers, no legal language",
+        },
+        {
+          role: "user",
+          content: `Transaction data: ${JSON.stringify(contextData)}\nWrite the customer-facing message:`,
+        },
+      ],
+    });
+
+    await recordTokenUsage(
+      response.usage.prompt_tokens,
+      response.usage.completion_tokens
+    );
+
+    return response.choices[0]?.message?.content?.trim() || extra;
+  } catch (err) {
+    console.warn("⚠️  generateNaturalResponse failed — using static fallback:", err.message);
+    return extra || "How can I assist you further?";
+  }
 }
 
 // ===============================
@@ -1602,10 +1827,67 @@ app.post("/sendbird-webhook", webhookLimiter, async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // ── No TXN ID — intent detection → KB lookup → fallback ──
+    // ── No TXN ID in message — LLM intent detection → KB lookup → fallback ──
     if (!txnMatch) {
-      const intent = detectIntent(messageText);
+      // ── HYBRID: LLM intent detection (falls back to rule-based when unavailable) ──
+      // Returns { intent, transaction_id, sentiment, suggested_action }
+      const {
+        intent,
+        transaction_id: llmTxnId,
+        sentiment: llmSentiment,
+      } = await detectIntent(messageText);
+
       await addBotToChannel(channelUrl);
+
+      // ── PART 5: Smart escalation — angry/frustrated sentiment ──
+      // If LLM detects strong negative sentiment but the user hasn't explicitly
+      // asked to escalate, surface escalation as the primary suggestion so the
+      // agent gets priority visibility.  We don't auto-create a Desk ticket here
+      // (the sentiment HIGH-keyword path above already handles the hardest cases);
+      // instead we add escalation to the suggestion buttons on every response.
+      const needsEscalationSuggestion =
+        (llmSentiment === "angry" || llmSentiment === "frustrated") &&
+        intent !== "escalation";
+
+      // ── PART 3: Transaction inference ──
+      // If LLM extracted a TXN ID from context (e.g. "my last payment" + history),
+      // treat it like a direct TXN lookup rather than asking the user again.
+      if (llmTxnId && /^TXN\d+$/i.test(llmTxnId)) {
+        const inferredTxn = await Transaction.findOne({ transactionId: llmTxnId.toUpperCase() });
+        if (inferredTxn) {
+          console.log(`[LLM] Inferred TXN from context: ${llmTxnId}`);
+          await updateConversationState(channelUrl, senderId, {
+            activeTxnId: inferredTxn.transactionId,
+            lastIntent: "transaction_lookup",
+          });
+          // Fall through to the TXN-found block below by spoofing txnMatch
+          // (we set the variable so the outer TXN block re-uses the same logic)
+          const naturalMsg = await generateNaturalResponse({
+            intent: "transaction_status",
+            txnId: inferredTxn.transactionId,
+            status: inferredTxn.status,
+            amount: inferredTxn.amount,
+            extra: `Transaction ${inferredTxn.transactionId} status: ${inferredTxn.status}. Amount: $${inferredTxn.amount}.`,
+          });
+          await sendBotMessage(channelUrl, naturalMsg, {
+            type: "action_buttons",
+            txnId: inferredTxn.transactionId,
+            buttons: inferredTxn.status === "failed"
+              ? [
+                  { label: "Retry Payment",  action: "retry_payment", txnId: inferredTxn.transactionId },
+                  { label: "Talk to Human",  action: "escalate" },
+                  { label: "View FAQ",       action: "faq" },
+                ]
+              : [
+                  { label: "Request Refund", action: "refund_start",  txnId: inferredTxn.transactionId },
+                  { label: "Talk to Agent",  action: "escalate" },
+                ],
+          });
+          return res.sendStatus(200);
+        }
+      }
+
+      // ── No TXN inferred; route by intent ──
 
       if (intent === "escalation") {
         if (!escalatedChannels.has(channelUrl)) {
@@ -1623,7 +1905,7 @@ app.post("/sendbird-webhook", webhookLimiter, async (req, res) => {
         return res.sendStatus(200);
       }
 
-      if (intent === "payment_retry") {
+      if (intent === "retry_payment") {
         await sendBotMessage(
           channelUrl,
           "Please provide your transaction ID (e.g., TXN1001) so I can initiate the retry."
@@ -1632,10 +1914,10 @@ app.post("/sendbird-webhook", webhookLimiter, async (req, res) => {
       }
 
       // ── Refund request — start negotiation engine ──
-      // Uses conversation memory (activeTxnId) if the user didn't specify a TXN.
+      // Uses LLM-extracted TXN ID if present, otherwise falls back to conversation memory.
       if (intent === "refund_request") {
         const state = await getConversationState(channelUrl);
-        const activeTxnId = state?.activeTxnId;
+        const activeTxnId = llmTxnId?.toUpperCase() || state?.activeTxnId;
 
         if (!activeTxnId) {
           await sendBotMessage(
@@ -1658,7 +1940,6 @@ app.post("/sendbird-webhook", webhookLimiter, async (req, res) => {
           return res.sendStatus(200);
         }
 
-        // Upsert a pending refund request record
         await RefundRequest.findOneAndUpdate(
           { userId: senderId, txnId: activeTxnId, channelUrl },
           {
@@ -1698,11 +1979,33 @@ app.post("/sendbird-webhook", webhookLimiter, async (req, res) => {
         return res.sendStatus(200);
       }
 
-      // Unknown intent — prompt for TXN ID
-      await sendBotMessage(
-        channelUrl,
-        "Please provide your transaction ID (e.g., TXN1001), or ask about our refund, cancellation, or fee policies."
-      );
+      // ── Unknown intent / fallback ──
+      // PART 6: Include suggestion buttons so the user always has a clear next step.
+      // If LLM detected frustration/anger, lead with an empathetic opening and put
+      // "Talk to Human" first in the suggestion list.
+      const fallbackText = needsEscalationSuggestion
+        ? "I can see you're having a frustrating experience — I'm sorry about that. Let me help you get to the right place quickly."
+        : "Please provide your transaction ID (e.g., TXN1001), or choose an option below:";
+
+      // PART 6: Suggestion buttons payload.
+      // Frontend detects custom_type === "SUGGESTIONS" and renders buttons below the message.
+      const suggestionButtons = needsEscalationSuggestion
+        ? [
+            { label: "Talk to Human",  action: "escalate" },
+            { label: "Retry Payment",  action: "retry_payment" },
+            { label: "View FAQ",       action: "faq" },
+          ]
+        : [
+            { label: "Retry Payment",  action: "retry_payment" },
+            { label: "Talk to Human",  action: "escalate" },
+            { label: "View FAQ",       action: "faq" },
+          ];
+
+      await sendBotMessage(channelUrl, fallbackText, {
+        // custom_type "SUGGESTIONS" signals the frontend to render these as buttons
+        type: "SUGGESTIONS",
+        suggestions: suggestionButtons,
+      });
       return res.sendStatus(200);
     }
 
@@ -1748,18 +2051,26 @@ app.post("/sendbird-webhook", webhookLimiter, async (req, res) => {
         metadata: { status: "failed", amount: transaction.amount },
       });
 
-      // Send structured message with action buttons.
-      // The frontend parses message.data to render interactive buttons inline.
+      // PART 4: Natural language response — LLM wraps the backend-validated data
+      // in a warm, empathetic tone.  Falls back to static text when unavailable.
+      const failedMsg = await generateNaturalResponse({
+        intent: "transaction_status",
+        txnId,
+        status: "failed",
+        amount: transaction.amount,
+        extra: `Your transaction ${txnId} ($${transaction.amount}) has failed. A support case has been opened. How would you like to proceed?`,
+      });
+
       await sendBotMessage(
         channelUrl,
-        `Your transaction ${txnId} ($${transaction.amount}) has failed. A support case has been opened. How would you like to proceed?`,
+        failedMsg,
         {
           type: "action_buttons",
           txnId,
           buttons: [
             { label: "Retry Payment", action: "retry_payment", txnId },
             { label: "Talk to Human", action: "escalate" },
-            { label: "View FAQ", action: "faq" },
+            { label: "View FAQ",      action: "faq" },
           ],
         }
       );
@@ -1767,10 +2078,18 @@ app.post("/sendbird-webhook", webhookLimiter, async (req, res) => {
     }
 
     if (transaction.status === "success") {
-      // Successful transaction: inform the user and offer refund or agent options
+      // PART 4: Natural language response for successful transaction
+      const successMsg = await generateNaturalResponse({
+        intent: "transaction_status",
+        txnId,
+        status: "success",
+        amount: transaction.amount,
+        extra: `Transaction ${txnId} completed successfully ✅. Amount: $${transaction.amount}.\nNeed help with this transaction?`,
+      });
+
       await sendBotMessage(
         channelUrl,
-        `Transaction ${txnId} completed successfully ✅. Amount: $${transaction.amount}.\nNeed help with this transaction?`,
+        successMsg,
         {
           type: "action_buttons",
           txnId,
@@ -1796,6 +2115,33 @@ app.post("/sendbird-webhook", webhookLimiter, async (req, res) => {
 });
 
 // ----------------------------------------------------------
+// GET /llm-budget
+// Returns current OpenAI token usage and cost against the $5 test budget.
+// Useful for monitoring spend without logging into the OpenAI dashboard.
+// ----------------------------------------------------------
+app.get("/llm-budget", async (req, res) => {
+  try {
+    const budget = await TokenBudget.findOne({ _id: "global" }) || {};
+    const spent     = budget.totalCostUSD      || 0;
+    const remaining = Math.max(0, OPENAI_BUDGET_USD - spent);
+    const usedPct   = (spent / OPENAI_BUDGET_USD) * 100;
+    return res.json({
+      budget_usd:           OPENAI_BUDGET_USD,
+      spent_usd:            parseFloat(spent.toFixed(6)),
+      remaining_usd:        parseFloat(remaining.toFixed(6)),
+      used_pct:             parseFloat(usedPct.toFixed(2)),
+      status:               budget.warningLevel || "ok",  // ok | warn_60 | warn_80 | exhausted
+      total_input_tokens:   budget.totalInputTokens  || 0,
+      total_output_tokens:  budget.totalOutputTokens || 0,
+      llm_enabled:          openai !== null,
+      note: "LLM calls are disabled automatically when spent_usd >= budget_usd",
+    });
+  } catch (err) {
+    return handleError(res, err, "llm-budget");
+  }
+});
+
+// ----------------------------------------------------------
 // GET / and GET /health — health check (used by uptime monitors to keep the
 // Render service awake; excluded from rate limiting via the skip rule above)
 // ----------------------------------------------------------
@@ -1803,6 +2149,10 @@ const healthHandler = (_req, res) => {
   res.json({
     status: "ok",
     service: "fintech-ai-backend",
+    // ── LLM status ──────────────────────────────────────────────────────────
+    llm_mode: openai ? "hybrid (gpt-4o-mini + rule-based fallback)" : "rule-based only (OPENAI_API_KEY not set)",
+    llm_budget: openai ? `$${OPENAI_BUDGET_USD} configured — GET /llm-budget for live usage` : "N/A",
+    // ── Other services ───────────────────────────────────────────────────────
     stripe: stripe ? "configured" : "not configured (demo mode)",
     stripe_webhook_secret: STRIPE_WEBHOOK_SECRET ? "set" : "MISSING ⚠️ — MongoDB won't update after payment",
     frontend_url: FRONTEND_URL || "MISSING ⚠️ — Stripe redirects to localhost:3000 instead of your app",
@@ -1811,7 +2161,7 @@ const healthHandler = (_req, res) => {
     sendbird_desk_token: SENDBIRDDESKAPITOKEN ? "set" : "MISSING ⚠️ — desk ticket creation will fail",
     mongodb: mongoose.connection.readyState === 1 ? "connected" : "disconnected",
     escalated_channels_in_memory: escalatedChannels.size,
-    features: "refund-negotiation, policy-engine, sentiment-detection, conversation-memory, analytics",
+    features: "hybrid-llm-intent, refund-negotiation, policy-engine, sentiment-detection, conversation-memory, analytics, suggestion-buttons",
   });
 };
 app.get("/", healthHandler);
