@@ -830,6 +830,43 @@ app.get("/debug-desk", async (req, res) => {
 });
 
 // ----------------------------------------------------------
+// GET /desk-info
+// Returns the Desk routing groups, recent tickets, and agent list so we can
+// diagnose why tickets aren't appearing in the dashboard.
+// ----------------------------------------------------------
+app.get("/desk-info", async (req, res) => {
+  const baseUrl = `https://desk-api-${SENDBIRD_APP_ID}.sendbird.com/platform/v1`;
+  const headers = { SENDBIRDDESKAPITOKEN: SENDBIRDDESKAPITOKEN, "Content-Type": "application/json" };
+  const result = {};
+
+  // Fetch agent groups (routing groups)
+  try {
+    const r = await axios.get(`${baseUrl}/agent_groups?limit=20`, { headers });
+    result.agent_groups = r.data;
+  } catch (err) {
+    result.agent_groups = { error: err.response?.status, detail: err.response?.data || err.message };
+  }
+
+  // Fetch recent tickets (last 10, all statuses)
+  try {
+    const r = await axios.get(`${baseUrl}/tickets?limit=10&offset=0`, { headers });
+    result.recent_tickets = r.data;
+  } catch (err) {
+    result.recent_tickets = { error: err.response?.status, detail: err.response?.data || err.message };
+  }
+
+  // Fetch active agents
+  try {
+    const r = await axios.get(`${baseUrl}/agents?status=ACTIVE&limit=20`, { headers });
+    result.active_agents = r.data;
+  } catch (err) {
+    result.active_agents = { error: err.response?.status, detail: err.response?.data || err.message };
+  }
+
+  res.json(result);
+});
+
+// ----------------------------------------------------------
 // POST /payment-webhook
 // Stripe calls this after a successful checkout.session.completed event.
 // Verifies the Stripe signature, updates the transaction to "success", and
