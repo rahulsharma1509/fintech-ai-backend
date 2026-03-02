@@ -42,11 +42,20 @@ const crypto = require("crypto");
  * @param {function} next - next middleware
  */
 function verifySendbirdSignature(req, res, next) {
-  const apiToken = process.env.SENDBIRD_API_TOKEN;
+  // Sendbird signs webhooks with the MASTER API token specifically.
+  // SENDBIRD_MASTER_API_TOKEN should be the masked master token from:
+  //   Sendbird Dashboard → Settings → General → API tokens (master)
+  // SENDBIRD_API_TOKEN (sub token) is used for API calls but will NOT
+  // match webhook signatures — this is the #1 cause of signature mismatches.
+  const apiToken = process.env.SENDBIRD_MASTER_API_TOKEN || process.env.SENDBIRD_API_TOKEN;
 
   // Skip verification in dev if no token set (unlikely in production)
   if (!apiToken) {
     return next();
+  }
+
+  if (!process.env.SENDBIRD_MASTER_API_TOKEN) {
+    console.warn("⚠️  SENDBIRD_MASTER_API_TOKEN not set — falling back to SENDBIRD_API_TOKEN for signature check. Set SENDBIRD_MASTER_API_TOKEN to the Dashboard master token to fix signature mismatches.");
   }
 
   const signature = req.headers["x-sendbird-signature"];

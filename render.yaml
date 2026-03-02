@@ -13,6 +13,8 @@ services:
         sync: false
       - key: SENDBIRD_API_TOKEN
         sync: false
+      - key: SENDBIRD_MASTER_API_TOKEN
+        sync: false
       - key: SENDBIRDDESKAPITOKEN
         sync: false
       - key: HUBSPOT_TOKEN
