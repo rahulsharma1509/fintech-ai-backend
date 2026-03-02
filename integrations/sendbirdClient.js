@@ -54,7 +54,7 @@ async function sendBotMessage(channelUrl, message, data = null) {
  * Add the support bot (or other users) to a channel as members.
  */
 async function addBotToChannel(channelUrl) {
-  await axios.put(
+  await axios.post(
     `${CHAT_BASE()}/group_channels/${channelUrl}/members`,
     { user_ids: ["support_bot"] },
     { headers: chatHeaders() }
@@ -115,7 +115,7 @@ async function getRecentMessages(channelUrl, limit = 20) {
  * Non-fatal — Sendbird sometimes rejects Chat API member-management on Desk channels.
  */
 async function addMembersToChannel(channelUrl, userIds) {
-  await axios.put(
+  await axios.post(
     `${CHAT_BASE()}/group_channels/${channelUrl}/members`,
     { user_ids: userIds },
     { headers: chatHeaders() }
