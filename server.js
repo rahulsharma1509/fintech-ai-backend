@@ -1,70 +1,87 @@
 /**
  * server.js — Entry point
  * -----------------------
- * This file ONLY handles:
- *   1. Express app setup (CORS, body parsing, trust proxy)
- *   2. Global + webhook HTTP rate limiting (express-rate-limit)
- *   3. Vendor initialization (MongoDB, Redis, OpenAI, Stripe, Sendbird bot)
- *   4. Route registration (delegated to /controllers)
- *   5. Per-user rate limiting middleware (delegated to /middleware)
- *
- * Business logic lives in /controllers, /services, and /policies.
- * This separation means this file rarely needs to change.
+ * Handles: Express setup, middleware, routes, vendor init, startup hooks.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * ARCHITECTURE OVERVIEW
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * /models          — Mongoose schemas (Transaction, RefundRequest, AuditLog, etc.)
- * /integrations    — Vendor clients (Redis, OpenAI, Stripe, Sendbird API)
- * /middleware      — Cross-cutting concerns (idempotency, rate limits, signatures)
- * /policies        — Deterministic business rules (RefundPolicyEngine)
- * /services        — Orchestration layer (intentService, sessionService, auditService)
- * /controllers     — HTTP route handlers (webhookController, refundController, etc.)
+ * /models          — Mongoose schemas
+ * /integrations    — Vendor clients (Redis, OpenAI, Stripe, Sendbird, S3, Firebase, Telegram)
+ * /middleware      — Cross-cutting concerns (idempotency, rate limits, signatures, feature flags, admin auth)
+ * /policies        — Deterministic business rules (RefundPolicyEngine, FraudEngine)
+ * /services        — Orchestration layer (intent, session, audit, desk, push notifications)
+ * /queues          — BullMQ queue definitions
+ * /workers         — BullMQ job processors (payment, refund, escalation)
+ * /controllers     — HTTP route handlers
+ * /admin           — Admin dashboard static HTML
  *
- * Data flow for a typical webhook:
+ * DATA FLOW (typical webhook):
  *   Sendbird → POST /sendbird-webhook
- *   → verifySendbirdSignature (middleware)
- *   → idempotencyMiddleware (middleware)
- *   → userRateLimitMiddleware (middleware)
- *   → webhookController.js (routes to intent/TXN handlers)
- *   → intentService.detectIntent() (LLM classification)
- *   → transactionService / refundController (DB operations)
- *   → RefundPolicyEngine.evaluate() (deterministic decision)
- *   → Stripe API / Sendbird API (financial execution)
- *   → auditService.log() (compliance trail)
+ *   → verifySendbirdSignature → idempotencyMiddleware → userRateLimitMiddleware
+ *   → webhookController → intentService → FraudEngine → RefundPolicyEngine
+ *   → transactionService / refundController → Stripe / Sendbird API
+ *   → auditService (compliance trail)
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * FREE TIER SUMMARY
+ * ─────────────────────────────────────────────────────────────────────────────
+ *   MongoDB Atlas:  512MB free (M0 cluster)
+ *   Redis Cloud:    30MB free — https://redis.com/try-free/
+ *   Render:         750 hrs/month free (web service)
+ *   OpenAI:         Pay-per-use — guarded by OPENAI_BUDGET_USD ($5 default)
+ *   Sendbird:       Free tier — 100 MAU, 1000 channels
+ *   Stripe:         Free sandbox — no charges in test mode
+ *   Telegram Bot:   Completely free
+ *   Firebase FCM:   Completely free (Spark plan)
+ *   AWS S3:         5GB / 12 months free — then ~$0.023/GB
+ * ─────────────────────────────────────────────────────────────────────────────
  */
 
 require("dotenv").config();
 
-const express  = require("express");
-const mongoose = require("mongoose");
-const cors     = require("cors");
+const express   = require("express");
+const mongoose  = require("mongoose");
+const cors      = require("cors");
 const rateLimit = require("express-rate-limit");
+const path      = require("path");
 
 // ── Vendor initializers ───────────────────────────────────────────────────────
-const { initOpenAI }  = require("./integrations/openaiClient");
-const { initStripe }  = require("./integrations/stripeClient");
-const { initRedis }   = require("./integrations/redisClient");
+const { initOpenAI }    = require("./integrations/openaiClient");
+const { initStripe }    = require("./integrations/stripeClient");
+const { initRedis }     = require("./integrations/redisClient");
+const { initFirebase }  = require("./integrations/firebaseClient");
+const { initS3 }        = require("./integrations/s3Client");
 const { ensureBotUser } = require("./integrations/sendbirdClient");
+
+// ── Queue + worker initializers ───────────────────────────────────────────────
+const { initQueues }            = require("./queues/index");
+const { startPaymentWorker }    = require("./workers/paymentWorker");
+const { startRefundWorker }     = require("./workers/refundWorker");
+const { startEscalationWorker } = require("./workers/escalationWorker");
 
 // ── Route controllers ─────────────────────────────────────────────────────────
 const webhookController               = require("./controllers/webhookController");
 const { sendbirdWebhookHandler }      = require("./controllers/webhookController");
 const refundController                = require("./controllers/refundController");
-const transactionController = require("./controllers/transactionController");
-const userController        = require("./controllers/userController");
+const transactionController           = require("./controllers/transactionController");
+const userController                  = require("./controllers/userController");
+const telegramController              = require("./controllers/telegramController");
+const uploadController                = require("./controllers/uploadController");
+const adminController                 = require("./controllers/adminController");
 
 // ── Middleware ────────────────────────────────────────────────────────────────
-const { idempotencyMiddleware }      = require("./middleware/idempotencyMiddleware");
-const { userRateLimitMiddleware }    = require("./middleware/rateLimitMiddleware");
-const { verifySendbirdSignature }    = require("./middleware/webhookSignatureMiddleware");
+const { idempotencyMiddleware }    = require("./middleware/idempotencyMiddleware");
+const { userRateLimitMiddleware }  = require("./middleware/rateLimitMiddleware");
+const { verifySendbirdSignature }  = require("./middleware/webhookSignatureMiddleware");
+const { seedFeatureFlags }         = require("./middleware/featureFlagMiddleware");
 
-// ── Services (startup hooks) ──────────────────────────────────────────────────
-const { loadEscalatedChannels } = require("./services/deskService");
+// ── Services ──────────────────────────────────────────────────────────────────
+const { loadEscalatedChannels }  = require("./services/deskService");
 
-// ── Other model imports needed for diagnostic endpoints ───────────────────────
-const { TokenBudget } = require("./models");
+// ── Models ────────────────────────────────────────────────────────────────────
+const { TokenBudget, UserSession } = require("./models");
 
 // ===============================
 // EXPRESS SETUP
@@ -72,8 +89,8 @@ const { TokenBudget } = require("./models");
 const app = express();
 app.use(cors());
 
-// express.json verify callback saves req.rawBody only for webhook routes
-// so Stripe + Sendbird signature verification can access the raw bytes.
+// express.json with rawBody capture for webhook signature verification.
+// Sendbird and Stripe both require the raw bytes to verify HMAC signatures.
 app.use(
   express.json({
     verify: (req, _res, buf) => {
@@ -84,8 +101,7 @@ app.use(
   })
 );
 
-// Trust the first proxy hop so express-rate-limit reads the real client IP
-// from X-Forwarded-For (required on Render, Heroku, Vercel, etc.)
+// Trust first proxy hop (required on Render/Heroku for correct IP in rate limiting)
 app.set("trust proxy", 1);
 
 // ── Request logging ───────────────────────────────────────────────────────────
@@ -98,9 +114,9 @@ app.use((req, res, next) => {
 });
 
 // ===============================
-// HTTP-LEVEL RATE LIMITING (express-rate-limit)
+// HTTP-LEVEL RATE LIMITING
 // ===============================
-// Global: 200 req/15min per IP — protects all non-webhook routes
+// Global: 200 req/15min per IP — covers all non-webhook routes
 const globalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 200,
@@ -143,9 +159,16 @@ console.log("Starting server...");
 
 initOpenAI();
 initStripe();
+initFirebase();   // FCM — no-op if FIREBASE_CONFIG_PATH not set
+initS3();         // AWS S3 — no-op if AWS credentials not set
 
 (async () => {
   await initRedis();
+  // Queues + workers start after Redis is ready
+  initQueues();
+  startPaymentWorker();
+  startRefundWorker();
+  startEscalationWorker();
 })();
 
 // ===============================
@@ -157,6 +180,7 @@ mongoose
     console.log("MongoDB Connected");
     await ensureBotUser();
     await loadEscalatedChannels();
+    await seedFeatureFlags();   // seed default feature flags if not present
   })
   .catch((err) => console.error("Mongo Error:", err));
 
@@ -164,17 +188,7 @@ mongoose
 // ROUTES
 // ===============================
 
-// Sendbird webhook — layered middleware:
-//   1. HTTP rate limiter (express-rate-limit)
-//   2. Signature verification (HMAC)
-//   3. Persistent idempotency (Redis + MongoDB)
-//   4. Per-user rate limit (Redis sliding window)
-//   5. Business logic (sendbirdWebhookHandler — registered directly, not via router)
-//
-// WHY app.post() instead of app.use() with a router:
-//   app.use("/sendbird-webhook", router) strips the path prefix before passing
-//   to the router, so router.post("/sendbird-webhook", ...) would never match.
-//   Registering the handler directly as app.post() avoids that Express quirk.
+// ── Sendbird webhook — full middleware chain ──────────────────────────────────
 app.post(
   "/sendbird-webhook",
   webhookLimiter,
@@ -184,11 +198,43 @@ app.post(
   sendbirdWebhookHandler
 );
 
-// Other routes (no extra middleware beyond the global limiter above)
-app.use("/", webhookController);       // /escalate, /payment-webhook
-app.use("/", refundController);        // /refund-action, /process-refund
-app.use("/", transactionController);   // /transaction-list, /view-transaction, /retry-payment, /analytics
-app.use("/", userController);          // /register-user, /welcome, /knowledge-base
+// ── Telegram webhook — rate limited at the controller level ──────────────────
+app.use("/", telegramController);
+
+// ── File uploads ──────────────────────────────────────────────────────────────
+app.use("/", uploadController);
+
+// ── Other bot/payment routes ──────────────────────────────────────────────────
+app.use("/", webhookController);
+app.use("/", refundController);
+app.use("/", transactionController);
+app.use("/", userController);
+
+// ── Admin dashboard — protected by Basic Auth ─────────────────────────────────
+// Route: /admin → serves admin/index.html
+// Route: /admin/api/* → JSON data endpoints
+app.use("/admin", adminController);
+
+// ── FCM push token registration ───────────────────────────────────────────────
+// Frontend calls this after requesting notification permission.
+// Stores the FCM device token in UserSession for push delivery.
+// ⚠️  MANUAL STEP: frontend must call this after Firebase SDK init.
+app.post("/register-push-token", async (req, res) => {
+  const { userId, fcmToken } = req.body;
+  if (!userId || !fcmToken) {
+    return res.status(400).json({ error: "userId and fcmToken are required" });
+  }
+  try {
+    await UserSession.findOneAndUpdate(
+      { userId },
+      { fcmToken, updatedAt: new Date() },
+      { upsert: true }
+    );
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // ===============================
 // DIAGNOSTIC / UTILITY ENDPOINTS
@@ -197,8 +243,7 @@ app.use("/", userController);          // /register-user, /welcome, /knowledge-b
 // GET /llm-budget — live OpenAI spend vs configured budget
 app.get("/llm-budget", async (req, res) => {
   try {
-    const { OPENAI_BUDGET_USD } = require("./integrations/openaiClient");
-    const { getOpenAI } = require("./integrations/openaiClient");
+    const { OPENAI_BUDGET_USD, getOpenAI } = require("./integrations/openaiClient");
     const budget = await TokenBudget.findOne({ _id: "global" }) || {};
     const spent     = budget.totalCostUSD      || 0;
     const remaining = Math.max(0, OPENAI_BUDGET_USD - spent);
@@ -234,63 +279,7 @@ app.get("/clear-escalation", async (req, res) => {
   res.json({ success: true, message: "Cleared all escalation mappings", deleted: del.deletedCount });
 });
 
-// GET /debug-desk?userId=<userId> — test Desk API connectivity step-by-step
-app.get("/debug-desk", async (req, res) => {
-  const axios = require("axios");
-  const userId = req.query.userId || "debug_user";
-  const baseUrl = `https://desk-api-${SENDBIRD_APP_ID}.sendbird.com/platform/v1`;
-  const headers = { SENDBIRDDESKAPITOKEN: SENDBIRDDESKAPITOKEN, "Content-Type": "application/json" };
-  const result = {};
-
-  try {
-    const r = await axios.get(`${baseUrl}/customers?sendbird_id=${userId}`, { headers });
-    result.customerSearch = { status: r.status, data: r.data };
-  } catch (err) {
-    result.customerSearch = { error: err.response?.status, detail: err.response?.data || err.message };
-    return res.json({ step_failed: "customerSearch", result });
-  }
-
-  let customerId = result.customerSearch.data?.results?.[0]?.id;
-  if (!customerId) {
-    try {
-      const r = await axios.post(`${baseUrl}/customers`, { sendbirdId: userId, displayName: userId }, { headers });
-      customerId = r.data.id;
-      result.customerCreate = { status: r.status, data: r.data };
-    } catch (err) {
-      result.customerCreate = { error: err.response?.status, detail: err.response?.data || err.message };
-      return res.json({ step_failed: "customerCreate", result });
-    }
-  } else {
-    result.customerCreate = { skipped: true, customerId };
-  }
-
-  try {
-    const r = await axios.post(`${baseUrl}/tickets`, { channelName: `Debug - ${userId}`, customerId }, { headers });
-    result.ticketCreate = { status: r.status, data: r.data };
-  } catch (err) {
-    result.ticketCreate = { error: err.response?.status, detail: err.response?.data || err.message };
-    return res.json({ step_failed: "ticketCreate", result });
-  }
-
-  return res.json({ all_steps_passed: true, result });
-});
-
-// GET /desk-info — routing groups, recent tickets, active agents
-app.get("/desk-info", async (req, res) => {
-  const axios = require("axios");
-  const baseUrl = `https://desk-api-${SENDBIRD_APP_ID}.sendbird.com/platform/v1`;
-  const headers = { SENDBIRDDESKAPITOKEN: SENDBIRDDESKAPITOKEN, "Content-Type": "application/json" };
-  const result = {};
-  try { const r = await axios.get(`${baseUrl}/agent_groups?limit=20`, { headers }); result.agent_groups = r.data; }
-  catch (err) { result.agent_groups = { error: err.response?.status }; }
-  try { const r = await axios.get(`${baseUrl}/tickets?limit=10&offset=0`, { headers }); result.recent_tickets = r.data; }
-  catch (err) { result.recent_tickets = { error: err.response?.status }; }
-  try { const r = await axios.get(`${baseUrl}/agents?status=ACTIVE&limit=20`, { headers }); result.active_agents = r.data; }
-  catch (err) { result.active_agents = { error: err.response?.status }; }
-  res.json(result);
-});
-
-// GET /audit-logs?userId=<id>&limit=<n> — compliance audit trail
+// GET /audit-logs — compliance audit trail (also available under /admin/api/audit-logs with auth)
 app.get("/audit-logs", async (req, res) => {
   try {
     const { AuditLog } = require("./models");
@@ -305,12 +294,52 @@ app.get("/audit-logs", async (req, res) => {
   }
 });
 
+// GET /debug-desk — test Desk API connectivity step-by-step
+app.get("/debug-desk", async (req, res) => {
+  const axios = require("axios");
+  const userId = req.query.userId || "debug_user";
+  const baseUrl = `https://desk-api-${SENDBIRD_APP_ID}.sendbird.com/platform/v1`;
+  const headers = { SENDBIRDDESKAPITOKEN: SENDBIRDDESKAPITOKEN, "Content-Type": "application/json" };
+  const result = {};
+  try {
+    const r = await axios.get(`${baseUrl}/customers?sendbird_id=${userId}`, { headers });
+    result.customerSearch = { status: r.status, data: r.data };
+  } catch (err) {
+    result.customerSearch = { error: err.response?.status, detail: err.response?.data || err.message };
+    return res.json({ step_failed: "customerSearch", result });
+  }
+  let customerId = result.customerSearch.data?.results?.[0]?.id;
+  if (!customerId) {
+    try {
+      const r = await axios.post(`${baseUrl}/customers`, { sendbirdId: userId, displayName: userId }, { headers });
+      customerId = r.data.id;
+      result.customerCreate = { status: r.status, data: r.data };
+    } catch (err) {
+      result.customerCreate = { error: err.response?.status, detail: err.response?.data || err.message };
+      return res.json({ step_failed: "customerCreate", result });
+    }
+  } else {
+    result.customerCreate = { skipped: true, customerId };
+  }
+  try {
+    const r = await axios.post(`${baseUrl}/tickets`, { channelName: `Debug - ${userId}`, customerId }, { headers });
+    result.ticketCreate = { status: r.status, data: r.data };
+  } catch (err) {
+    result.ticketCreate = { error: err.response?.status, detail: err.response?.data || err.message };
+    return res.json({ step_failed: "ticketCreate", result });
+  }
+  return res.json({ all_steps_passed: true, result });
+});
+
 // GET / and GET /health — health check
 const healthHandler = async (_req, res) => {
   const { getOpenAI, OPENAI_BUDGET_USD } = require("./integrations/openaiClient");
   const { getStripe } = require("./integrations/stripeClient");
   const { getClient: getRedisClient } = require("./integrations/redisClient");
+  const { getMessaging } = require("./integrations/firebaseClient");
+  const { getS3 } = require("./integrations/s3Client");
   const { escalatedChannels } = require("./services/deskService");
+  const { getQueueStats } = require("./queues/index");
 
   let budgetStatus = "N/A";
   try {
@@ -320,25 +349,42 @@ const healthHandler = async (_req, res) => {
     }
   } catch {}
 
+  let queueStatus = "unavailable";
+  try {
+    const qs = await getQueueStats();
+    queueStatus = Object.keys(qs).length > 0 ? "ready" : "unavailable";
+  } catch {}
+
   res.json({
     status: "ok",
     service: "fintech-ai-backend",
-    architecture: "layered (controllers/services/policies/integrations/middleware/models)",
+    architecture: "layered (controllers/services/policies/queues/workers/integrations/middleware/models)",
     llm_mode: getOpenAI() ? "hybrid (gpt-4o-mini + rule-based fallback)" : "rule-based only",
     llm_budget: budgetStatus,
     stripe: getStripe() ? "configured" : "demo mode",
     redis: getRedisClient() ? "connected" : "not connected (in-memory fallback)",
     mongodb: mongoose.connection.readyState === 1 ? "connected" : "disconnected",
+    firebase_fcm: getMessaging() ? "configured" : "not configured",
+    s3: getS3() ? "configured" : "not configured",
+    telegram: process.env.TELEGRAM_BOT_TOKEN ? "configured" : "not configured",
+    queues: queueStatus,
     escalated_channels: escalatedChannels.size,
     features: [
       "persistent-idempotency (Redis+MongoDB)",
       "per-user-rate-limiting (10/min, 100/day)",
-      "webhook-signature-verification",
+      "webhook-signature-verification (master-token)",
       "conversation-memory (UserSession+Redis cache)",
       "refund-policy-engine (7-day window, fraud score)",
+      "fraud-engine (deterministic rules, no LLM)",
       "audit-logging",
       "hybrid-llm-intent",
       "agent-away-fallback-timer",
+      "bullmq-background-jobs",
+      "telegram-bridge",
+      "fcm-push-notifications",
+      "s3-file-uploads",
+      "feature-flags (MongoDB)",
+      "admin-dashboard (/admin)",
     ].join(", "),
   });
 };

@@ -174,6 +174,69 @@ const tokenBudgetSchema = new mongoose.Schema({
 });
 const TokenBudget = mongoose.model("TokenBudget", tokenBudgetSchema);
 
+// ──────────────────────────────────────────────────────────────────────────────
+// FRAUD LOG — stores output of FraudEngine.evaluate() for every refund attempt
+// Purely deterministic — no LLM involved. Used for admin review and policy tuning.
+// ──────────────────────────────────────────────────────────────────────────────
+const fraudLogSchema = new mongoose.Schema({
+  userId: { type: String, index: true },
+  txnId: String,
+  riskScore: Number,           // 0–100
+  riskLevel: {                 // LOW | MEDIUM | HIGH
+    type: String,
+    enum: ["LOW", "MEDIUM", "HIGH"],
+  },
+  action: {                    // APPROVE | PARTIAL | ESCALATE
+    type: String,
+    enum: ["APPROVE", "PARTIAL", "ESCALATE"],
+  },
+  triggers: [String],          // e.g. ["rapid_requests", "high_refund_amount"]
+  refundAmountINR: Number,     // amount at time of evaluation
+  refundsInLast30Days: Number, // snapshot of refund count used in evaluation
+  createdAt: { type: Date, default: Date.now, index: true },
+});
+const FraudLog = mongoose.model("FraudLog", fraudLogSchema);
+
+// ──────────────────────────────────────────────────────────────────────────────
+// FEATURE FLAG — MongoDB-backed feature gates
+// Toggle features at runtime without redeploying.
+// Flags are seeded on startup if they don't exist.
+// ──────────────────────────────────────────────────────────────────────────────
+const featureFlagSchema = new mongoose.Schema({
+  name: { type: String, unique: true, index: true },
+  enabled: { type: Boolean, default: false },
+  description: String,
+  updatedAt: { type: Date, default: Date.now },
+});
+const FeatureFlag = mongoose.model("FeatureFlag", featureFlagSchema);
+
+// ──────────────────────────────────────────────────────────────────────────────
+// TELEGRAM USER — maps Telegram chat IDs to Sendbird user IDs
+// Allows a Telegram user to interact with the same bot as a Sendbird user.
+// ──────────────────────────────────────────────────────────────────────────────
+const telegramUserSchema = new mongoose.Schema({
+  telegramId: { type: String, unique: true, index: true }, // Telegram chat_id (string)
+  sendbirdUserId: String,                                   // mapped Sendbird userId
+  telegramUsername: String,                                 // @username (may be empty)
+  channelUrl: String,                                       // active Sendbird channel
+  createdAt: { type: Date, default: Date.now },
+});
+const TelegramUser = mongoose.model("TelegramUser", telegramUserSchema);
+
+// ──────────────────────────────────────────────────────────────────────────────
+// UPLOAD PROOF — S3 file upload records (payment screenshots)
+// ──────────────────────────────────────────────────────────────────────────────
+const uploadProofSchema = new mongoose.Schema({
+  userId: { type: String, index: true },
+  txnId: String,
+  s3Key: String,         // S3 object key
+  s3Url: String,         // public/pre-signed URL
+  fileSize: Number,      // bytes
+  mimeType: String,
+  createdAt: { type: Date, default: Date.now },
+});
+const UploadProof = mongoose.model("UploadProof", uploadProofSchema);
+
 module.exports = {
   Transaction,
   RefundRequest,
@@ -185,4 +248,8 @@ module.exports = {
   ChannelMapping,
   RegisteredUser,
   TokenBudget,
+  FraudLog,
+  FeatureFlag,
+  TelegramUser,
+  UploadProof,
 };
