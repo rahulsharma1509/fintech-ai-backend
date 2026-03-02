@@ -49,8 +49,9 @@ const { initRedis }   = require("./integrations/redisClient");
 const { ensureBotUser } = require("./integrations/sendbirdClient");
 
 // ── Route controllers ─────────────────────────────────────────────────────────
-const webhookController     = require("./controllers/webhookController");
-const refundController      = require("./controllers/refundController");
+const webhookController               = require("./controllers/webhookController");
+const { sendbirdWebhookHandler }      = require("./controllers/webhookController");
+const refundController                = require("./controllers/refundController");
 const transactionController = require("./controllers/transactionController");
 const userController        = require("./controllers/userController");
 
@@ -168,14 +169,19 @@ mongoose
 //   2. Signature verification (HMAC)
 //   3. Persistent idempotency (Redis + MongoDB)
 //   4. Per-user rate limit (Redis sliding window)
-//   5. Business logic (webhookController)
-app.use(
+//   5. Business logic (sendbirdWebhookHandler — registered directly, not via router)
+//
+// WHY app.post() instead of app.use() with a router:
+//   app.use("/sendbird-webhook", router) strips the path prefix before passing
+//   to the router, so router.post("/sendbird-webhook", ...) would never match.
+//   Registering the handler directly as app.post() avoids that Express quirk.
+app.post(
   "/sendbird-webhook",
   webhookLimiter,
   verifySendbirdSignature,
   idempotencyMiddleware,
   userRateLimitMiddleware,
-  webhookController
+  sendbirdWebhookHandler
 );
 
 // Other routes (no extra middleware beyond the global limiter above)

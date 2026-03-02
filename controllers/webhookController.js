@@ -58,12 +58,13 @@ async function createHubSpotTicket(txnId, email) {
 }
 
 // ----------------------------------------------------------
-// POST /sendbird-webhook
+// sendbirdWebhookHandler
 // Main bot logic — routes every incoming message.
-// Idempotency and per-user rate limiting are handled by middleware
-// applied in server.js before this handler runs.
+// Exported as a named function (not a router route) so server.js
+// can register it directly with app.post(), ensuring the middleware
+// chain (signature, idempotency, rate-limit) fires correctly.
 // ----------------------------------------------------------
-router.post("/sendbird-webhook", async (req, res) => {
+async function sendbirdWebhookHandler(req, res) {
   try {
     const event = req.body;
 
@@ -94,7 +95,15 @@ router.post("/sendbird-webhook", async (req, res) => {
       if (mapping && senderId !== mapping.userId) {
         console.log(`📨 Forwarding agent message to customer channel: ${mapping.originalChannelUrl}`);
         clearAgentAwayTimer(mapping.originalChannelUrl);
-        await sendBotMessage(mapping.originalChannelUrl, `[Support Agent]: ${messageText}`);
+        // Ensure bot is in the customer channel before forwarding
+        try { await addBotToChannel(mapping.originalChannelUrl); } catch {}
+        try {
+          await sendBotMessage(mapping.originalChannelUrl, `[Support Agent]: ${messageText}`);
+        } catch (err) {
+          console.error("⚠️ Failed to forward agent message to customer:", err.response?.data || err.message);
+        }
+      } else {
+        console.log(`📩 Desk channel message ignored: senderId=${senderId}, userId=${mapping?.userId}, isFromCustomer=${senderId === mapping?.userId}`);
       }
       return res.sendStatus(200);
     }
@@ -109,7 +118,20 @@ router.post("/sendbird-webhook", async (req, res) => {
       const mapping = await ChannelMapping.findOne({ originalChannelUrl: channelUrl });
       if (mapping) {
         console.log(`📨 Forwarding customer follow-up to Desk channel: ${mapping.deskChannelUrl}`);
-        await sendChannelMessage(mapping.deskChannelUrl, senderId, messageText);
+        // Wrap in try/catch — Desk channel API failures must not return 500
+        // (a 500 causes Sendbird to retry, but idempotency then blocks the retry → message permanently lost)
+        try {
+          await sendChannelMessage(mapping.deskChannelUrl, senderId, messageText);
+        } catch (err) {
+          console.error("⚠️ Failed to forward customer message to Desk channel:", err.response?.data || err.message);
+          // Fallback: send as bot so the agent still sees the message
+          try {
+            await addBotToChannel(mapping.deskChannelUrl);
+            await sendBotMessage(mapping.deskChannelUrl, `[Customer ${senderId}]: ${messageText}`);
+          } catch (fallbackErr) {
+            console.error("⚠️ Fallback bot forward also failed:", fallbackErr.message);
+          }
+        }
       }
       return res.sendStatus(200);
     }
@@ -394,7 +416,7 @@ router.post("/sendbird-webhook", async (req, res) => {
     console.error("Webhook error:", error.response?.data || error.message);
     return res.sendStatus(500);
   }
-});
+}
 
 // ----------------------------------------------------------
 // POST /payment-webhook
@@ -549,4 +571,8 @@ router.post("/escalate", async (req, res) => {
   }
 });
 
+// sendbirdWebhookHandler is registered directly in server.js via app.post()
+// to avoid Express router path-stripping when mounted at /sendbird-webhook.
+// The router here only handles /payment-webhook and /escalate.
 module.exports = router;
+module.exports.sendbirdWebhookHandler = sendbirdWebhookHandler;
