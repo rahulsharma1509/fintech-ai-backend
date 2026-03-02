@@ -29,28 +29,48 @@ let _admin = null;
 let _messaging = null;
 
 function initFirebase() {
+  // ── Two ways to provide the Firebase service account ─────────────────────
+  //
+  // Option A — FIREBASE_SERVICE_ACCOUNT_BASE64 (recommended for Render/cloud):
+  //   base64-encode your firebase.json and paste the result as an env var.
+  //   How to encode on Mac/Linux:
+  //     base64 -i firebase.json | pbcopy    ← copies to clipboard (Mac)
+  //     base64 -i firebase.json             ← prints to terminal (Linux)
+  //   Set in Render: FIREBASE_SERVICE_ACCOUNT_BASE64 = <paste here>
+  //
+  // Option B — FIREBASE_CONFIG_PATH (local dev only):
+  //   Download firebase.json → save as config/firebase.json
+  //   Set in .env: FIREBASE_CONFIG_PATH=./config/firebase.json
+  //   ⚠️  Never commit config/firebase.json to GitHub.
+  //
+  // If neither is set, push notifications are silently disabled.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  const b64 = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64;
   const configPath = process.env.FIREBASE_CONFIG_PATH;
 
-  if (!configPath) {
-    console.log("ℹ️  FIREBASE_CONFIG_PATH not set — push notifications disabled");
+  if (!b64 && !configPath) {
+    console.log("ℹ️  Firebase not configured — push notifications disabled");
     return;
   }
 
   try {
     const admin = require("firebase-admin");
-    // Prevent re-initialization if called multiple times
     if (admin.apps.length === 0) {
-      const serviceAccount = require(`../${configPath.replace(/^\.\//, "")}`);
-      admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount),
-      });
+      let serviceAccount;
+      if (b64) {
+        // Decode base64 → parse JSON (works on Render, Heroku, any cloud host)
+        serviceAccount = JSON.parse(Buffer.from(b64, "base64").toString("utf8"));
+      } else {
+        serviceAccount = require(`../${configPath.replace(/^\.\//, "")}`);
+      }
+      admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
     }
     _admin = admin;
     _messaging = admin.messaging();
     console.log("✅ Firebase Admin SDK initialized (FCM ready)");
   } catch (err) {
     console.warn("⚠️  Firebase init failed — push notifications disabled:", err.message);
-    // Non-fatal: app runs without push notifications if Firebase isn't configured
   }
 }
 
