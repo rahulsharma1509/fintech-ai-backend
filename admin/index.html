@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Fintech AI Admin</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}
+  header{background:#1a1d2e;border-bottom:1px solid #2d3748;padding:16px 24px;display:flex;align-items:center;gap:12px}
+  header h1{font-size:18px;font-weight:600;color:#7c3aed}
+  header span{color:#64748b;font-size:13px}
+  .tabs{display:flex;gap:0;border-bottom:1px solid #2d3748;background:#1a1d2e;padding:0 24px}
+  .tab{padding:12px 16px;font-size:13px;cursor:pointer;color:#64748b;border-bottom:2px solid transparent;transition:all .2s}
+  .tab:hover{color:#e2e8f0}
+  .tab.active{color:#7c3aed;border-bottom-color:#7c3aed}
+  .content{padding:24px;max-width:1400px;margin:0 auto}
+  .section{display:none}.section.active{display:block}
+  .stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px;margin-bottom:24px}
+  .stat-card{background:#1a1d2e;border:1px solid #2d3748;border-radius:8px;padding:16px}
+  .stat-card .label{font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px}
+  .stat-card .value{font-size:28px;font-weight:700;color:#e2e8f0}
+  .stat-card .sub{font-size:11px;color:#64748b;margin-top:4px}
+  .llm-bar-wrap{height:6px;background:#2d3748;border-radius:3px;margin-top:8px;overflow:hidden}
+  .llm-bar{height:100%;background:#7c3aed;border-radius:3px;transition:width .5s}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  thead th{text-align:left;padding:10px 12px;color:#64748b;font-weight:500;border-bottom:1px solid #2d3748;font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+  tbody tr:hover{background:#1e2433}
+  tbody td{padding:10px 12px;border-bottom:1px solid #1e2433;color:#cbd5e1;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:500}
+  .badge-green{background:#064e3b;color:#6ee7b7}
+  .badge-red{background:#450a0a;color:#fca5a5}
+  .badge-yellow{background:#422006;color:#fcd34d}
+  .badge-blue{background:#0c1a3a;color:#93c5fd}
+  .badge-purple{background:#2e1065;color:#c4b5fd}
+  .card{background:#1a1d2e;border:1px solid #2d3748;border-radius:8px;overflow:hidden;margin-bottom:16px}
+  .card-header{padding:12px 16px;border-bottom:1px solid #2d3748;font-size:13px;font-weight:500;color:#94a3b8}
+  .flag-list{padding:0}
+  .flag-row{display:flex;align-items:flex-start;justify-content:space-between;padding:14px 16px;border-bottom:1px solid #1e2433;gap:16px}
+  .flag-row:last-child{border-bottom:none}
+  .flag-info{flex:1}
+  .flag-name{font-size:13px;font-weight:600;color:#e2e8f0;margin-bottom:3px}
+  .flag-desc{font-size:11px;color:#64748b;line-height:1.5}
+  .toggle{position:relative;width:40px;height:22px;flex-shrink:0}
+  .toggle input{opacity:0;width:0;height:0}
+  .slider{position:absolute;cursor:pointer;inset:0;background:#374151;border-radius:22px;transition:.2s}
+  .slider:before{content:'';position:absolute;width:16px;height:16px;left:3px;bottom:3px;background:white;border-radius:50%;transition:.2s}
+  input:checked+.slider{background:#7c3aed}
+  input:checked+.slider:before{transform:translateX(18px)}
+  .queue-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px}
+  .queue-card{background:#1a1d2e;border:1px solid #2d3748;border-radius:8px;padding:16px}
+  .queue-card h3{font-size:13px;font-weight:600;margin-bottom:12px;color:#94a3b8;text-transform:capitalize}
+  .queue-stat{display:flex;justify-content:space-between;font-size:12px;margin-bottom:6px}
+  .queue-stat .k{color:#64748b}
+  .queue-stat .v{font-weight:600}
+  .v-wait{color:#fbbf24}.v-active{color:#34d399}.v-done{color:#6ee7b7}.v-fail{color:#f87171}
+  .refresh-btn{background:#2d3748;border:none;color:#94a3b8;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px;margin-left:auto;display:block;margin-bottom:12px}
+  .refresh-btn:hover{background:#374151;color:#e2e8f0}
+  .empty{text-align:center;padding:32px;color:#4b5563;font-size:13px}
+  .risk-high{color:#f87171;font-weight:600}
+  .risk-medium{color:#fbbf24;font-weight:600}
+  .risk-low{color:#6ee7b7;font-weight:600}
+</style>
+</head>
+<body>
+<header>
+  <h1>⚡ Fintech AI Admin</h1>
+  <span id="lastRefresh"></span>
+</header>
+
+<div class="tabs">
+  <div class="tab active" data-tab="overview">Overview</div>
+  <div class="tab" data-tab="transactions">Transactions</div>
+  <div class="tab" data-tab="refunds">Refunds</div>
+  <div class="tab" data-tab="fraud">Fraud Logs</div>
+  <div class="tab" data-tab="audit">Audit Logs</div>
+  <div class="tab" data-tab="flags">Feature Flags</div>
+  <div class="tab" data-tab="queues">Queues</div>
+</div>
+
+<div class="content">
+
+  <!-- OVERVIEW -->
+  <div class="section active" id="section-overview">
+    <div class="stats-grid" id="stats-cards">
+      <div class="stat-card"><div class="label">Transactions</div><div class="value" id="s-txn">—</div></div>
+      <div class="stat-card"><div class="label">Refund Requests</div><div class="value" id="s-ref">—</div></div>
+      <div class="stat-card"><div class="label">Fraud Logs</div><div class="value" id="s-fraud">—</div></div>
+      <div class="stat-card"><div class="label">Audit Events</div><div class="value" id="s-audit">—</div></div>
+      <div class="stat-card">
+        <div class="label">LLM Spend</div>
+        <div class="value" id="s-llm-spent">—</div>
+        <div class="sub" id="s-llm-sub"></div>
+        <div class="llm-bar-wrap"><div class="llm-bar" id="s-llm-bar" style="width:0%"></div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- TRANSACTIONS -->
+  <div class="section" id="section-transactions">
+    <button class="refresh-btn" onclick="loadTransactions()">↻ Refresh</button>
+    <div class="card">
+      <div class="card-header">Recent Transactions</div>
+      <div style="overflow-x:auto">
+        <table>
+          <thead><tr><th>TXN ID</th><th>User</th><th>Amount</th><th>Status</th><th>Created</th></tr></thead>
+          <tbody id="txn-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- REFUNDS -->
+  <div class="section" id="section-refunds">
+    <button class="refresh-btn" onclick="loadRefunds()">↻ Refresh</button>
+    <div class="card">
+      <div class="card-header">Refund Requests</div>
+      <div style="overflow-x:auto">
+        <table>
+          <thead><tr><th>TXN ID</th><th>User</th><th>Reason</th><th>Decision</th><th>Status</th><th>Created</th></tr></thead>
+          <tbody id="ref-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- FRAUD LOGS -->
+  <div class="section" id="section-fraud">
+    <button class="refresh-btn" onclick="loadFraud()">↻ Refresh</button>
+    <div class="card">
+      <div class="card-header">Fraud Engine Evaluations</div>
+      <div style="overflow-x:auto">
+        <table>
+          <thead><tr><th>User</th><th>TXN</th><th>Score</th><th>Risk</th><th>Action</th><th>Triggers</th><th>Date</th></tr></thead>
+          <tbody id="fraud-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- AUDIT LOGS -->
+  <div class="section" id="section-audit">
+    <button class="refresh-btn" onclick="loadAudit()">↻ Refresh</button>
+    <div class="card">
+      <div class="card-header">Audit Trail</div>
+      <div style="overflow-x:auto">
+        <table>
+          <thead><tr><th>Action</th><th>User</th><th>TXN</th><th>Details</th><th>Date</th></tr></thead>
+          <tbody id="audit-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- FEATURE FLAGS -->
+  <div class="section" id="section-flags">
+    <div class="card">
+      <div class="card-header">Feature Flags — toggle takes effect within 30 seconds</div>
+      <div class="flag-list" id="flag-list"></div>
+    </div>
+  </div>
+
+  <!-- QUEUES -->
+  <div class="section" id="section-queues">
+    <button class="refresh-btn" onclick="loadQueues()">↻ Refresh</button>
+    <div class="queue-grid" id="queue-grid"></div>
+  </div>
+
+</div>
+
+<script>
+const BASE = window.location.pathname.replace(/\/$/, "");
+
+// ── Tab switching ─────────────────────────────────────────────────────────────
+document.querySelectorAll(".tab").forEach(tab => {
+  tab.addEventListener("click", () => {
+    document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+    document.querySelectorAll(".section").forEach(s => s.classList.remove("active"));
+    tab.classList.add("active");
+    document.getElementById("section-" + tab.dataset.tab).classList.add("active");
+    loadSection(tab.dataset.tab);
+  });
+});
+
+function loadSection(name) {
+  if (name === "overview")     loadStats();
+  if (name === "transactions") loadTransactions();
+  if (name === "refunds")      loadRefunds();
+  if (name === "fraud")        loadFraud();
+  if (name === "audit")        loadAudit();
+  if (name === "flags")        loadFlags();
+  if (name === "queues")       loadQueues();
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function fmt(date) { return date ? new Date(date).toLocaleString() : "—"; }
+function esc(s)    { return String(s || "").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+function statusBadge(s) {
+  const map = {
+    success:"badge-green", failed:"badge-red", pending:"badge-yellow",
+    refunded:"badge-blue", approved:"badge-green", rejected:"badge-red",
+    completed:"badge-green", HIGH:"badge-red", MEDIUM:"badge-yellow", LOW:"badge-green",
+    APPROVE:"badge-green", PARTIAL:"badge-yellow", ESCALATE:"badge-red",
+    ESCALATE_HIGH:"badge-red", ESCALATE_NORMAL:"badge-yellow", AUTO_REFUND:"badge-green",
+  };
+  return `<span class="badge ${map[s]||'badge-blue'}">${esc(s)}</span>`;
+}
+
+// ── Stats ─────────────────────────────────────────────────────────────────────
+async function loadStats() {
+  const r = await fetch(BASE+"/api/stats");
+  const d = await r.json();
+  document.getElementById("s-txn").textContent   = d.transactions;
+  document.getElementById("s-ref").textContent   = d.refundRequests;
+  document.getElementById("s-fraud").textContent = d.fraudLogs;
+  document.getElementById("s-audit").textContent = d.auditLogs;
+  document.getElementById("s-llm-spent").textContent = "$" + (d.llm.spent_usd||0).toFixed(4);
+  document.getElementById("s-llm-sub").textContent   = `${d.llm.used_pct}% of $${d.llm.budget_usd}`;
+  document.getElementById("s-llm-bar").style.width   = Math.min(d.llm.used_pct, 100) + "%";
+  document.getElementById("lastRefresh").textContent = "Updated " + new Date().toLocaleTimeString();
+}
+
+// ── Transactions ──────────────────────────────────────────────────────────────
+async function loadTransactions() {
+  const r = await fetch(BASE+"/api/transactions");
+  const d = await r.json();
+  const tb = document.getElementById("txn-body");
+  if (!d.data?.length) { tb.innerHTML = `<tr><td colspan=5 class="empty">No transactions</td></tr>`; return; }
+  tb.innerHTML = d.data.map(t => `<tr>
+    <td><code>${esc(t.transactionId)}</code></td>
+    <td>${esc(t.userId)}</td>
+    <td>$${esc(t.amount)}</td>
+    <td>${statusBadge(t.status)}</td>
+    <td>${fmt(t.createdAt)}</td>
+  </tr>`).join("");
+}
+
+// ── Refunds ───────────────────────────────────────────────────────────────────
+async function loadRefunds() {
+  const r = await fetch(BASE+"/api/refunds");
+  const d = await r.json();
+  const tb = document.getElementById("ref-body");
+  if (!d.data?.length) { tb.innerHTML = `<tr><td colspan=6 class="empty">No refund requests</td></tr>`; return; }
+  tb.innerHTML = d.data.map(t => `<tr>
+    <td><code>${esc(t.txnId)}</code></td>
+    <td>${esc(t.userId)}</td>
+    <td>${esc(t.refundReason||"—")}</td>
+    <td>${t.finalDecision ? statusBadge(t.finalDecision) : "—"}</td>
+    <td>${statusBadge(t.status)}</td>
+    <td>${fmt(t.createdAt)}</td>
+  </tr>`).join("");
+}
+
+// ── Fraud Logs ────────────────────────────────────────────────────────────────
+async function loadFraud() {
+  const r = await fetch(BASE+"/api/fraud-logs");
+  const d = await r.json();
+  const tb = document.getElementById("fraud-body");
+  if (!d.data?.length) { tb.innerHTML = `<tr><td colspan=7 class="empty">No fraud logs</td></tr>`; return; }
+  tb.innerHTML = d.data.map(t => `<tr>
+    <td>${esc(t.userId)}</td>
+    <td><code>${esc(t.txnId||"—")}</code></td>
+    <td><span class="risk-${(t.riskLevel||"low").toLowerCase()}">${esc(t.riskScore)}</span></td>
+    <td>${statusBadge(t.riskLevel)}</td>
+    <td>${statusBadge(t.action)}</td>
+    <td title="${esc((t.triggers||[]).join(", "))}">${esc((t.triggers||[]).join(", ").slice(0,40))}</td>
+    <td>${fmt(t.createdAt)}</td>
+  </tr>`).join("");
+}
+
+// ── Audit Logs ────────────────────────────────────────────────────────────────
+async function loadAudit() {
+  const r = await fetch(BASE+"/api/audit-logs");
+  const d = await r.json();
+  const tb = document.getElementById("audit-body");
+  if (!d.data?.length) { tb.innerHTML = `<tr><td colspan=5 class="empty">No audit logs</td></tr>`; return; }
+  tb.innerHTML = d.data.map(t => `<tr>
+    <td>${statusBadge(t.actionType)}</td>
+    <td>${esc(t.userId||"—")}</td>
+    <td><code>${esc(t.txnId||"—")}</code></td>
+    <td title="${esc(JSON.stringify(t.details||{}))}">
+      ${esc(JSON.stringify(t.details||{}).slice(0,60))}
+    </td>
+    <td>${fmt(t.createdAt)}</td>
+  </tr>`).join("");
+}
+
+// ── Feature Flags ─────────────────────────────────────────────────────────────
+async function loadFlags() {
+  const r = await fetch(BASE+"/api/feature-flags");
+  const flags = await r.json();
+  const container = document.getElementById("flag-list");
+  container.innerHTML = flags.map(f => `
+    <div class="flag-row">
+      <div class="flag-info">
+        <div class="flag-name">${esc(f.name)}</div>
+        <div class="flag-desc">${esc(f.description||"")}</div>
+      </div>
+      <label class="toggle">
+        <input type="checkbox" ${f.enabled?"checked":""} onchange="toggleFlag('${esc(f.name)}', this.checked)">
+        <span class="slider"></span>
+      </label>
+    </div>
+  `).join("");
+}
+
+async function toggleFlag(name, enabled) {
+  await fetch(BASE+"/api/feature-flags/"+name+"/toggle", {
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({enabled}),
+  });
+}
+
+// ── Queues ────────────────────────────────────────────────────────────────────
+async function loadQueues() {
+  const r = await fetch(BASE+"/api/queue-status");
+  const d = await r.json();
+  const grid = document.getElementById("queue-grid");
+  grid.innerHTML = Object.entries(d).map(([name, s]) => `
+    <div class="queue-card">
+      <h3>${esc(name)}</h3>
+      ${s.status ? `<div style="color:#64748b;font-size:12px">${esc(s.status)}</div>` : `
+        <div class="queue-stat"><span class="k">Waiting</span><span class="v v-wait">${s.waiting}</span></div>
+        <div class="queue-stat"><span class="k">Active</span><span class="v v-active">${s.active}</span></div>
+        <div class="queue-stat"><span class="k">Completed</span><span class="v v-done">${s.completed}</span></div>
+        <div class="queue-stat"><span class="k">Failed</span><span class="v v-fail">${s.failed}</span></div>
+        <div class="queue-stat"><span class="k">Delayed</span><span class="v">${s.delayed}</span></div>
+      `}
+    </div>
+  `).join("");
+}
+
+// ── Initial load ──────────────────────────────────────────────────────────────
+loadStats();
+</script>
+</body>
+</html>
