@@ -55,7 +55,7 @@ async function sendBotMessage(channelUrl, message, data = null) {
  */
 async function addBotToChannel(channelUrl) {
   await axios.post(
-    `${CHAT_BASE()}/group_channels/${channelUrl}/members`,
+    `${CHAT_BASE()}/group_channels/${channelUrl}/invite`,
     { user_ids: ["support_bot"] },
     { headers: chatHeaders() }
   );
@@ -116,7 +116,7 @@ async function getRecentMessages(channelUrl, limit = 20) {
  */
 async function addMembersToChannel(channelUrl, userIds) {
   await axios.post(
-    `${CHAT_BASE()}/group_channels/${channelUrl}/members`,
+    `${CHAT_BASE()}/group_channels/${channelUrl}/invite`,
     { user_ids: userIds },
     { headers: chatHeaders() }
   );
