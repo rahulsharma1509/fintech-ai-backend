@@ -15,8 +15,9 @@ const express = require("express");
 const router = express.Router();
 
 const { addBotToChannel, sendBotMessage, sendChannelMessage } = require("../integrations/sendbirdClient");
+const { sendTelegramMessage } = require("../integrations/telegramClient");
 const { constructWebhookEvent, getStripe } = require("../integrations/stripeClient");
-const { Transaction, ChannelMapping } = require("../models");
+const { Transaction, ChannelMapping, TelegramUser } = require("../models");
 const {
   detectIntent,
   generateNaturalResponse,
@@ -36,6 +37,22 @@ const {
   sendDeskContext,
 } = require("../services/deskService");
 const { RefundRequest } = require("../models");
+
+async function relayBotReplyToTelegram(channelUrl, text) {
+  if (!channelUrl || !text) return;
+  try {
+    const tgUser = await TelegramUser.findOne({ channelUrl }).lean();
+    if (!tgUser?.telegramId) return;
+    await sendTelegramMessage(tgUser.telegramId, text);
+  } catch (err) {
+    console.warn("[Telegram relay] failed:", err.message);
+  }
+}
+
+async function sendBotMessageAndRelay(channelUrl, message, data) {
+  await sendBotMessage(channelUrl, message, data);
+  await relayBotReplyToTelegram(channelUrl, message);
+}
 
 // HubSpot (optional)
 async function createHubSpotTicket(txnId, email) {
@@ -98,7 +115,7 @@ async function sendbirdWebhookHandler(req, res) {
         // Ensure bot is in the customer channel before forwarding
         try { await addBotToChannel(mapping.originalChannelUrl); } catch {}
         try {
-          await sendBotMessage(mapping.originalChannelUrl, `[Support Agent]: ${messageText}`);
+          await sendBotMessageAndRelay(mapping.originalChannelUrl, `[Support Agent]: ${messageText}`);
         } catch (err) {
           console.error("⚠️ Failed to forward agent message to customer:", err.response?.data || err.message);
         }
@@ -127,7 +144,7 @@ async function sendbirdWebhookHandler(req, res) {
           // Fallback: send as bot so the agent still sees the message
           try {
             await addBotToChannel(mapping.deskChannelUrl);
-            await sendBotMessage(mapping.deskChannelUrl, `[Customer ${senderId}]: ${messageText}`);
+            await sendBotMessageAndRelay(mapping.deskChannelUrl, `[Customer ${senderId}]: ${messageText}`);
           } catch (fallbackErr) {
             console.error("⚠️ Fallback bot forward also failed:", fallbackErr.message);
           }
@@ -159,7 +176,7 @@ async function sendbirdWebhookHandler(req, res) {
         userId: senderId, channelUrl,
         metadata: { priority: "HIGH", triggers: sentimentTriggers },
       });
-      await sendBotMessage(
+      await sendBotMessageAndRelay(
         channelUrl,
         "🚨 Your message has been flagged as high priority. A senior support agent has been notified and will contact you immediately.",
         { type: "priority_badge", priority: "HIGH" }
@@ -196,7 +213,7 @@ async function sendbirdWebhookHandler(req, res) {
             amount: inferredTxn.amount,
             extra: `Transaction ${inferredTxn.transactionId} status: ${inferredTxn.status}. Amount: $${inferredTxn.amount}.`,
           });
-          await sendBotMessage(channelUrl, naturalMsg, {
+          await sendBotMessageAndRelay(channelUrl, naturalMsg, {
             type: "action_buttons",
             txnId: inferredTxn.transactionId,
             buttons: inferredTxn.status === "failed"
@@ -225,7 +242,7 @@ async function sendbirdWebhookHandler(req, res) {
             console.error("Desk escalation failed (non-fatal):", err.message);
           }
         }
-        await sendBotMessage(
+        await sendBotMessageAndRelay(
           channelUrl,
           "Connecting you with a human support agent now. Please hold on — an agent will be with you shortly."
         );
@@ -233,7 +250,7 @@ async function sendbirdWebhookHandler(req, res) {
       }
 
       if (intent === "retry_payment") {
-        await sendBotMessage(
+        await sendBotMessageAndRelay(
           channelUrl,
           "Please provide your transaction ID (e.g., TXN1001) so I can initiate the retry."
         );
@@ -245,7 +262,7 @@ async function sendbirdWebhookHandler(req, res) {
         const activeTxnId = llmTxnId?.toUpperCase() || state?.activeTxnId;
 
         if (!activeTxnId) {
-          await sendBotMessage(
+          await sendBotMessageAndRelay(
             channelUrl,
             "To start a refund request, please provide your transaction ID first (e.g., TXN1001)."
           );
@@ -254,14 +271,14 @@ async function sendbirdWebhookHandler(req, res) {
 
         const refundTxn = await findTransaction(activeTxnId, senderId);
         if (!refundTxn || refundTxn.status === "failed") {
-          await sendBotMessage(
+          await sendBotMessageAndRelay(
             channelUrl,
             `Transaction ${activeTxnId} is not eligible for a refund (refunds apply to successful transactions only).`
           );
           return res.sendStatus(200);
         }
         if (refundTxn.status === "refunded") {
-          await sendBotMessage(channelUrl, `A refund for ${activeTxnId} has already been processed.`);
+          await sendBotMessageAndRelay(channelUrl, `A refund for ${activeTxnId} has already been processed.`);
           return res.sendStatus(200);
         }
 
@@ -280,7 +297,7 @@ async function sendbirdWebhookHandler(req, res) {
         });
         await trackAnalytics("refund_request", { userId: senderId, txnId: activeTxnId, channelUrl });
 
-        await sendBotMessage(
+        await sendBotMessageAndRelay(
           channelUrl,
           `I can help with a refund for ${activeTxnId} ($${refundTxn.amount}). Please select the reason:`,
           {
@@ -301,7 +318,7 @@ async function sendbirdWebhookHandler(req, res) {
       // KB fallback
       const kbResult = queryKnowledgeBase(messageText);
       if (kbResult.found) {
-        await sendBotMessage(channelUrl, kbResult.answer);
+        await sendBotMessageAndRelay(channelUrl, kbResult.answer);
         return res.sendStatus(200);
       }
 
@@ -322,7 +339,7 @@ async function sendbirdWebhookHandler(req, res) {
             { label: "View FAQ",       action: "faq" },
           ];
 
-      await sendBotMessage(channelUrl, fallbackText, {
+      await sendBotMessageAndRelay(channelUrl, fallbackText, {
         type: "action_buttons",
         buttons: suggestionButtons,
       });
@@ -337,7 +354,7 @@ async function sendbirdWebhookHandler(req, res) {
 
     if (!transaction) {
       await addBotToChannel(channelUrl);
-      await sendBotMessage(
+      await sendBotMessageAndRelay(
         channelUrl,
         `Transaction ${txnId} was not found in our system. Please check the ID and try again.`
       );
@@ -375,7 +392,7 @@ async function sendbirdWebhookHandler(req, res) {
         extra: `Your transaction ${txnId} ($${transaction.amount}) has failed. A support case has been opened. How would you like to proceed?`,
       });
 
-      await sendBotMessage(channelUrl, failedMsg, {
+      await sendBotMessageAndRelay(channelUrl, failedMsg, {
         type: "action_buttons",
         txnId,
         buttons: [
@@ -396,7 +413,7 @@ async function sendbirdWebhookHandler(req, res) {
         extra: `Transaction ${txnId} completed successfully ✅. Amount: $${transaction.amount}.\nNeed help with this transaction?`,
       });
 
-      await sendBotMessage(channelUrl, successMsg, {
+      await sendBotMessageAndRelay(channelUrl, successMsg, {
         type: "action_buttons",
         txnId,
         buttons: [
@@ -407,7 +424,7 @@ async function sendbirdWebhookHandler(req, res) {
       return res.sendStatus(200);
     }
 
-    await sendBotMessage(
+    await sendBotMessageAndRelay(
       channelUrl,
       `Transaction ${txnId} status: ${transaction.status} ⏳. Amount: $${transaction.amount}.`
     );
@@ -458,7 +475,7 @@ router.post("/payment-webhook", async (req, res) => {
       }
 
       if (channelUrl) {
-        await sendBotMessage(
+        await sendBotMessageAndRelay(
           channelUrl,
           `Payment for ${txnId} was successful! Your transaction is now complete. Thank you.`
         );
@@ -467,7 +484,7 @@ router.post("/payment-webhook", async (req, res) => {
       if (channelUrl && escalatedChannels.has(channelUrl)) {
         const mapping = await ChannelMapping.findOne({ originalChannelUrl: channelUrl });
         if (mapping) {
-          await sendBotMessage(
+          await sendBotMessageAndRelay(
             mapping.deskChannelUrl,
             `Customer ${userId} successfully retried payment for ${txnId}. Ticket can be closed.`
           );
@@ -533,7 +550,7 @@ router.post("/escalate", async (req, res) => {
           } catch {}
 
           if (!agentHasReplied) {
-            await sendBotMessage(
+            await sendBotMessageAndRelay(
               channelUrl,
               `Your support ticket is already open (Ticket #${mapping.ticketId || mapping.deskChannelUrl}). An agent will join shortly.`
             );
@@ -553,14 +570,14 @@ router.post("/escalate", async (req, res) => {
       escalatedChannels.add(channelUrl);
       scheduleAgentAwayFallback(channelUrl);
       const ticketRef = ticket?.ticketId ? ` (Ticket #${ticket.ticketId})` : "";
-      await sendBotMessage(
+      await sendBotMessageAndRelay(
         channelUrl,
         `Support ticket created${ticketRef}. An agent will join shortly.\n\nIn your Sendbird Desk dashboard, go to → All Tickets (or New/Unassigned) to find this ticket.`
       );
     } catch (err) {
       const errDetail = `${err.message} | HTTP ${err.response?.status} | ${JSON.stringify(err.response?.data)}`;
       console.error("Desk ticket creation failed:", errDetail);
-      await sendBotMessage(channelUrl, `DEBUG — ticket creation failed: ${errDetail}`);
+      await sendBotMessageAndRelay(channelUrl, `DEBUG — ticket creation failed: ${errDetail}`);
       return res.status(500).json({ error: "Failed to create support ticket", detail: errDetail });
     }
 
