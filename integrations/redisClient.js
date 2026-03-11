@@ -29,11 +29,12 @@ async function initRedis() {
 
   if (!process.env.REDIS_URL) {
     redisStatus = "fallback";
-    console.warn("⚠️  REDIS_URL not set — Redis features disabled (using in-memory/MongoDB fallback)");
+    console.warn("⚠️ REDIS_URL not set — Redis features disabled (using in-memory fallback)");
     return null;
   }
 
   client = createRedisClient(process.env.REDIS_URL);
+
   if (!client) {
     redisStatus = "fallback";
     return null;
@@ -56,12 +57,12 @@ async function initRedis() {
 
   client.on("end", () => {
     redisStatus = "fallback";
-    console.warn("⚠️  Redis connection ended — using fallback mode");
+    console.warn("⚠️ Redis connection ended — fallback mode enabled");
   });
 
   client.on("error", (err) => {
     redisStatus = "fallback";
-    console.warn("⚠️  Redis error — using fallback mode:", err.message);
+    console.warn("⚠️ Redis error:", err.message);
   });
 
   try {
@@ -70,15 +71,14 @@ async function initRedis() {
     redisStatus = "connected";
   } catch (err) {
     redisStatus = "fallback";
-    console.warn("⚠️  Redis unavailable:", err.message, "— falling back to MongoDB/in-memory");
-    // Keep client instance for reconnect attempts; all call-sites are fail-open.
+    console.warn("⚠️ Redis unavailable:", err.message, "— using fallback mode");
   }
 
   return client;
 }
 
 function getClient() {
-  if (!client || redisStatus === "fallback") return null;
+  if (!client || redisStatus !== "connected") return null;
   return client;
 }
 
@@ -87,73 +87,88 @@ function getRedisStatus() {
 }
 
 function getBullMQConnection() {
-  // Reuse the shared ioredis instance if connected.
   return getClient();
 }
 
 async function checkAndSetIdempotency(key, ttlSeconds = 300) {
-  if (!getClient()) return null;
+  const redis = getClient();
+  if (!redis) return null;
 
   try {
-    const result = await client.set(`idem:${key}`, "1", "EX", ttlSeconds, "NX");
+    const result = await redis.set(`idem:${key}`, "1", "EX", ttlSeconds, "NX");
     return result === null;
   } catch (err) {
-    console.warn("⚠️  Redis idempotency check failed:", err.message);
+    console.warn("⚠️ Redis idempotency check failed:", err.message);
     return null;
   }
 }
 
 async function checkRateLimit(userId, scope, limit, windowMs) {
-  if (!getClient()) return { allowed: true, remaining: limit };
+  const redis = getClient();
+  if (!redis) return { allowed: true, remaining: limit };
 
   const key = `rl:${userId}:${scope}`;
   const now = Date.now();
   const windowStart = now - windowMs;
 
   try {
-    await client.zremrangebyscore(key, "-inf", windowStart);
-    const count = await client.zcard(key);
+    // Remove old requests outside window
+    await redis.zremrangebyscore(key, "-inf", windowStart);
+
+    const count = await redis.zcard(key);
 
     if (count >= limit) {
       return { allowed: false, remaining: 0, resetMs: windowMs };
     }
 
-    await client.zadd(key, now, `${now}-${Math.random()}`);
-    await client.expire(key, Math.ceil(windowMs / 1000));
+    // Add request timestamp
+    await redis.zadd(key, now, `${now}-${Math.random()}`);
 
-    return { allowed: true, remaining: limit - count - 1 };
+    // Auto-expire key
+    await redis.expire(key, Math.ceil(windowMs / 1000));
+
+    return {
+      allowed: true,
+      remaining: limit - count - 1,
+    };
   } catch (err) {
-    console.warn("⚠️  Redis rate limit check failed:", err.message);
+    console.warn("⚠️ Redis rate limit check failed:", err.message);
     return { allowed: true, remaining: limit };
   }
 }
 
 async function cacheSession(userId, session, ttlSeconds = 900) {
-  if (!getClient()) return;
+  const redis = getClient();
+  if (!redis) return;
+
   try {
-    await client.set(`sess:${userId}`, JSON.stringify(session), "EX", ttlSeconds);
+    await redis.set(`sess:${userId}`, JSON.stringify(session), "EX", ttlSeconds);
   } catch (err) {
-    console.warn("⚠️  Redis session cache write failed:", err.message);
+    console.warn("⚠️ Redis session cache write failed:", err.message);
   }
 }
 
 async function getCachedSession(userId) {
-  if (!getClient()) return null;
+  const redis = getClient();
+  if (!redis) return null;
+
   try {
-    const raw = await client.get(`sess:${userId}`);
+    const raw = await redis.get(`sess:${userId}`);
     return raw ? JSON.parse(raw) : null;
   } catch (err) {
-    console.warn("⚠️  Redis session cache read failed:", err.message);
+    console.warn("⚠️ Redis session cache read failed:", err.message);
     return null;
   }
 }
 
 async function invalidateSession(userId) {
-  if (!getClient()) return;
+  const redis = getClient();
+  if (!redis) return;
+
   try {
-    await client.del(`sess:${userId}`);
+    await redis.del(`sess:${userId}`);
   } catch (err) {
-    console.warn("⚠️  Redis session invalidation failed:", err.message);
+    console.warn("⚠️ Redis session invalidation failed:", err.message);
   }
 }
 
