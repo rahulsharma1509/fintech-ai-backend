@@ -162,14 +162,17 @@ initStripe();
 initFirebase();   // FCM — no-op if FIREBASE_CONFIG_PATH not set
 initS3();         // AWS S3 — no-op if AWS credentials not set
 
-(async () => {
-  await initRedis();
-  // Queues + workers start after Redis is ready
-  initQueues();
-  startPaymentWorker();
-  startRefundWorker();
-  startEscalationWorker();
-})();
+initRedis()
+  .catch((err) => {
+    console.warn("⚠️  Redis init failed (continuing startup):", err.message);
+  })
+  .finally(() => {
+    // Start queues/workers only when shared Redis connection is available.
+    initQueues();
+    startPaymentWorker();
+    startRefundWorker();
+    startEscalationWorker();
+  });
 
 // ===============================
 // MongoDB + startup hooks
@@ -335,7 +338,7 @@ app.get("/debug-desk", async (req, res) => {
 const healthHandler = async (_req, res) => {
   const { getOpenAI, OPENAI_BUDGET_USD } = require("./integrations/openaiClient");
   const { getStripe } = require("./integrations/stripeClient");
-  const { getClient: getRedisClient } = require("./integrations/redisClient");
+  const { getRedisStatus } = require("./integrations/redisClient");
   const { getMessaging } = require("./integrations/firebaseClient");
   const { getS3 } = require("./integrations/s3Client");
   const { escalatedChannels } = require("./services/deskService");
@@ -362,7 +365,7 @@ const healthHandler = async (_req, res) => {
     llm_mode: getOpenAI() ? "hybrid (gpt-4o-mini + rule-based fallback)" : "rule-based only",
     llm_budget: budgetStatus,
     stripe: getStripe() ? "configured" : "demo mode",
-    redis: getRedisClient() ? "connected" : "not connected (in-memory fallback)",
+    redis: getRedisStatus(),
     mongodb: mongoose.connection.readyState === 1 ? "connected" : "disconnected",
     firebase_fcm: getMessaging() ? "configured" : "not configured",
     s3: getS3() ? "configured" : "not configured",
@@ -390,6 +393,22 @@ const healthHandler = async (_req, res) => {
 };
 app.get("/", healthHandler);
 app.get("/health", healthHandler);
+
+app.get("/redis-test", async (_req, res) => {
+  const { getClient, getRedisStatus } = require("./integrations/redisClient");
+  const redis = getClient();
+
+  if (!redis) {
+    return res.json({ redis: getRedisStatus(), ping: null });
+  }
+
+  try {
+    const pong = await redis.ping();
+    return res.json({ redis: "connected", ping: pong });
+  } catch (err) {
+    return res.status(503).json({ redis: "error", message: err.message });
+  }
+});
 
 // ===============================
 // START
