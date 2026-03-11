@@ -23,22 +23,18 @@ const { processRefundInternal } = require("../services/transactionService");
 const { sendBotMessage } = require("../integrations/sendbirdClient");
 const { sendPushNotification } = require("../services/pushNotificationService");
 const { log } = require("../services/auditService");
-
-function getConnection() {
-  if (process.env.REDIS_URL) {
-    return { url: process.env.REDIS_URL, maxRetriesPerRequest: null };
-  }
-  return {
-    host: process.env.REDIS_HOST || "localhost",
-    port: parseInt(process.env.REDIS_PORT || "6379"),
-    maxRetriesPerRequest: null,
-  };
-}
+const { getBullMQConnection } = require("../integrations/redisClient");
 
 let worker = null;
 
 function startRefundWorker() {
   try {
+    const conn = getBullMQConnection();
+    if (!conn) {
+      console.warn("⚠️  refundWorker not started: Redis not connected");
+      return;
+    }
+
     worker = new Worker(
       "refunds",
       async (job) => {
@@ -74,7 +70,7 @@ function startRefundWorker() {
         return { success: result.success, txnId };
       },
       {
-        connection: getConnection(),
+        connection: conn,
         concurrency: 3,  // process up to 3 refund jobs in parallel
       }
     );
