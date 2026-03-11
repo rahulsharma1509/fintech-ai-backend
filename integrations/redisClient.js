@@ -115,18 +115,11 @@ async function checkRateLimit(userId, scope, limit, windowMs) {
   const windowStart = now - windowMs;
 
   try {
-    const pipeline = client.pipeline();
-    // Remove entries outside the window
-    pipeline.zremrangebyscore(key, "-inf", windowStart);
-    // Count remaining entries in window
-    pipeline.zcard(key);
-    // Add current request timestamp (score=ts, member=ts+random for uniqueness)
-    pipeline.zadd(key, now, `${now}-${Math.random()}`);
-    // Set TTL to window duration so key auto-expires
-    pipeline.expire(key, Math.ceil(windowMs / 1000));
-
-    const results = await pipeline.exec();
-    const count = results[1][1]; // count BEFORE adding current request
+    // Remove entries outside the current window and read count first.
+    // Important: do NOT add a new entry when request is already blocked,
+    // otherwise repeated blocked attempts can keep extending the block.
+    await client.zremrangebyscore(key, "-inf", windowStart);
+    const count = await client.zcard(key);
 
     if (count >= limit) {
       return {
@@ -135,6 +128,11 @@ async function checkRateLimit(userId, scope, limit, windowMs) {
         resetMs: windowMs,
       };
     }
+
+    // Add current request timestamp (score=ts, member=ts+random for uniqueness)
+    await client.zadd(key, now, `${now}-${Math.random()}`);
+    // Set TTL to window duration so key auto-expires
+    await client.expire(key, Math.ceil(windowMs / 1000));
 
     return {
       allowed: true,
