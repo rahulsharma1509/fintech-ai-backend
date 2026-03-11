@@ -51,8 +51,8 @@ const UPLOAD_WINDOW_MS   = 24 * 60 * 60 * 1000;
 async function checkUploadRateLimit(userId) {
   try {
     const key = `upload_rate:${userId}`;
-    const count = await checkRateLimit(key, UPLOAD_WINDOW_MS, UPLOAD_DAILY_LIMIT);
-    return count <= UPLOAD_DAILY_LIMIT;
+    const result = await checkRateLimit(key, "day", UPLOAD_DAILY_LIMIT, UPLOAD_WINDOW_MS);
+    return result.allowed !== false;
   } catch {
     return true;
   }
