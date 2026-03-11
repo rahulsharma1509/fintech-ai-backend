@@ -37,8 +37,8 @@ const TELEGRAM_WINDOW_MS  = 60 * 1000;
 async function checkTelegramRateLimit(telegramId) {
   try {
     const key = `tg_rate:${telegramId}`;
-    const count = await checkRateLimit(key, TELEGRAM_WINDOW_MS, TELEGRAM_RATE_LIMIT);
-    return count <= TELEGRAM_RATE_LIMIT;
+    const result = await checkRateLimit(key, "min", TELEGRAM_RATE_LIMIT, TELEGRAM_WINDOW_MS);
+    return result.allowed !== false;
   } catch {
     return true; // fail open
   }
