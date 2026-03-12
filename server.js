@@ -394,6 +394,14 @@ const healthHandler = async (_req, res) => {
 app.get("/", healthHandler);
 app.get("/health", healthHandler);
 
+app.get("/cicd-test", (_req, res) => {
+  res.json({
+    message: "CI/CD pipeline working 🚀",
+    version: "v1",
+    timestamp: new Date().toISOString(),
+  });
+});
+
 app.get("/redis-test", async (_req, res) => {
   const { getClient, getRedisStatus } = require("./integrations/redisClient");
   const redis = getClient();
