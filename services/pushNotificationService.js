@@ -37,8 +37,8 @@ const PUSH_WINDOW_MS    = 24 * 60 * 60 * 1000;
 async function checkPushRateLimit(userId) {
   try {
     const key = `push_rate:${userId}`;
-    const count = await checkRateLimit(key, PUSH_WINDOW_MS, PUSH_DAILY_LIMIT);
-    return count <= PUSH_DAILY_LIMIT;
+    const result = await checkRateLimit(key, "day", PUSH_DAILY_LIMIT, PUSH_WINDOW_MS);
+    return result.allowed !== false;
   } catch {
     return true; // fail open — don't block notification on Redis error
   }

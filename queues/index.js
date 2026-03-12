@@ -29,19 +29,7 @@
  */
 
 const { Queue } = require("bullmq");
-
-// ── Redis connection config for BullMQ ────────────────────────────────────────
-// BullMQ requires maxRetriesPerRequest: null (it manages retries itself).
-function getConnection() {
-  if (process.env.REDIS_URL) {
-    return { url: process.env.REDIS_URL, maxRetriesPerRequest: null };
-  }
-  return {
-    host: process.env.REDIS_HOST || "localhost",
-    port: parseInt(process.env.REDIS_PORT || "6379"),
-    maxRetriesPerRequest: null,
-  };
-}
+const { getBullMQConnection } = require("../integrations/redisClient");
 
 // ── Default job options applied to every job ─────────────────────────────────
 const DEFAULT_JOB_OPTIONS = {
@@ -85,7 +73,11 @@ let _initialized = false;
 function initQueues() {
   if (_initialized) return;
   try {
-    const conn = getConnection();
+    const conn = getBullMQConnection();
+    if (!conn) {
+      console.warn("⚠️  BullMQ queues not initialized: Redis not connected");
+      return;
+    }
     paymentQueue    = new Queue("payments",    { connection: conn, defaultJobOptions: DEFAULT_JOB_OPTIONS });
     refundQueue     = new Queue("refunds",     { connection: conn, defaultJobOptions: DEFAULT_JOB_OPTIONS });
     escalationQueue = new Queue("escalations", { connection: conn, defaultJobOptions: DEFAULT_JOB_OPTIONS });

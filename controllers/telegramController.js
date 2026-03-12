@@ -27,7 +27,7 @@ const { TelegramUser } = require("../models");
 const { sendTelegramMessage } = require("../integrations/telegramClient");
 const { sendChannelMessage, addBotToChannel } = require("../integrations/sendbirdClient");
 const { ensureUserTransactions } = require("../services/transactionService");
-const { checkRateLimit } = require("../integrations/redisClient");
+const { checkRateLimit, checkAndSetIdempotency } = require("../integrations/redisClient");
 const { isEnabled } = require("../middleware/featureFlagMiddleware");
 
 // ── Per-Telegram-user rate limit: 20 msg/min ─────────────────────────────────
@@ -37,8 +37,8 @@ const TELEGRAM_WINDOW_MS  = 60 * 1000;
 async function checkTelegramRateLimit(telegramId) {
   try {
     const key = `tg_rate:${telegramId}`;
-    const count = await checkRateLimit(key, TELEGRAM_WINDOW_MS, TELEGRAM_RATE_LIMIT);
-    return count <= TELEGRAM_RATE_LIMIT;
+    const result = await checkRateLimit(key, "min", TELEGRAM_RATE_LIMIT, TELEGRAM_WINDOW_MS);
+    return result.allowed !== false;
   } catch {
     return true; // fail open
   }
@@ -127,6 +127,14 @@ router.post("/telegram-webhook", async (req, res) => {
 
   try {
     const update = req.body;
+
+    // Deduplicate Telegram retries/duplicate deliveries by update_id so
+    // one user message cannot be counted multiple times toward our limit.
+    if (update?.update_id != null) {
+      const duplicate = await checkAndSetIdempotency(`tg_update:${update.update_id}`, 300);
+      if (duplicate === true) return;
+    }
+
     const message = update.message;
     if (!message || !message.text) return; // ignore non-text updates (photos, stickers, etc.)
 
