@@ -38,12 +38,33 @@ const {
 } = require("../services/deskService");
 const { RefundRequest } = require("../models");
 
-async function relayBotReplyToTelegram(channelUrl, text) {
+async function relayBotReplyToTelegram(channelUrl, text, data = {}) {
   if (!channelUrl || !text) return;
   try {
     const tgUser = await TelegramUser.findOne({ channelUrl }).lean();
     if (!tgUser?.telegramId) return;
-    await sendTelegramMessage(tgUser.telegramId, text);
+
+    const extra = {};
+    // Render Sendbird action buttons as Telegram custom keyboard buttons.
+    // Pressing these sends the label text as a normal Telegram message,
+    // so existing message-intent logic can handle them without callback_query handling.
+    if (data?.type === "action_buttons" && Array.isArray(data?.buttons) && data.buttons.length > 0) {
+      const keyboard = data.buttons
+        .map((btn) => btn?.label)
+        .filter(Boolean)
+        .slice(0, 8)
+        .map((label) => [{ text: String(label) }]);
+
+      if (keyboard.length > 0) {
+        extra.reply_markup = {
+          keyboard,
+          resize_keyboard: true,
+          one_time_keyboard: true,
+        };
+      }
+    }
+
+    await sendTelegramMessage(tgUser.telegramId, text, extra);
   } catch (err) {
     console.warn("[Telegram relay] failed:", err.message);
   }
@@ -51,7 +72,7 @@ async function relayBotReplyToTelegram(channelUrl, text) {
 
 async function sendBotMessageAndRelay(channelUrl, message, data) {
   await sendBotMessage(channelUrl, message, data);
-  await relayBotReplyToTelegram(channelUrl, message);
+  await relayBotReplyToTelegram(channelUrl, message, data);
 }
 
 // HubSpot (optional)
