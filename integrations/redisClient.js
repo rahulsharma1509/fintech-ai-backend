@@ -131,19 +131,19 @@ async function checkRateLimit(userId, scope, limit, windowMs) {
 async function cacheSession(userId, session, ttlSeconds = 900) {
   if (!getClient()) return;
   try {
-    await client.set(`sess:${userId}`, JSON.stringify(session), "EX", ttlSeconds);
+    await redis.set(`sess:${userId}`, JSON.stringify(session), "EX", ttlSeconds);
   } catch (err) {
-    console.warn("⚠️  Redis session cache write failed:", err.message);
+    console.warn("⚠️ Redis session cache write failed:", err.message);
   }
 }
 
 async function getCachedSession(userId) {
   if (!getClient()) return null;
   try {
-    const raw = await client.get(`sess:${userId}`);
+    const raw = await redis.get(`sess:${userId}`);
     return raw ? JSON.parse(raw) : null;
   } catch (err) {
-    console.warn("⚠️  Redis session cache read failed:", err.message);
+    console.warn("⚠️ Redis session cache read failed:", err.message);
     return null;
   }
 }
@@ -151,9 +151,9 @@ async function getCachedSession(userId) {
 async function invalidateSession(userId) {
   if (!getClient()) return;
   try {
-    await client.del(`sess:${userId}`);
+    await redis.del(`sess:${userId}`);
   } catch (err) {
-    console.warn("⚠️  Redis session invalidation failed:", err.message);
+    console.warn("⚠️ Redis session invalidation failed:", err.message);
   }
 }
 
